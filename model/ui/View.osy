@@ -1,0 +1,386 @@
+// AN ASSIGNMENT ON ITS PAGE — the outcome wanted, what done means and how far that is, why it is or is not moving, the
+// work attached to it, the assignments it has to do with, what it has cost, and everything that happened.
+namespace Osysharp.Assignments;
+
+using Osysharp.Ui;
+
+/// WHAT ANOTHER KIT ADDS TO AN ASSIGNMENT'S PAGE — a panel under the assignment's own: its repository, its requests,
+/// whatever the kit keeps for it. A kit writes `component RepositoryPanel(Guid assignment) : AssignmentPanel` and every
+/// page that draws `AssignmentView` shows it.
+/// In a test, open the assignment's page and assert what the contribution draws.
+/// need: add a section to an assignment's page, show my kit's rows for an assignment
+/// e.g. `AssignmentPanel(assignment);`
+[Slot] public abstract component AssignmentPanel(Guid assignment);
+
+/// ⭐ AN ASSIGNMENT'S PAGE. Place it where the app shows one — `AssignmentView(id)` — and it draws the assignment as
+/// whoever is looking may read it: nothing for somebody who may not. `open` says where another assignment's page is,
+/// so the ones it has to do with are links: `AssignmentView(id, open: other => "/assignments/" + other)`.
+///
+/// Whoever works on it completes it from here — refused, with the reason, while a criterion is unmet — and whoever
+/// is in charge reopens it.
+[Composable]
+public component AssignmentView(Guid assignment, Func<Guid, string>? open = null) {
+  AssignmentSheet? sheet = null;
+  bool loaded = false;
+  string problem = "";
+  bool completing = false;
+  bool reopening = false;
+  string outcome = "";
+  string why = "";
+
+  action Load() {
+    try { sheet = SheetOf(assignment); problem = ""; } catch (Exception ex) { problem = ex.Message; }
+    loaded = true;
+  }
+  on mount { Load(); }
+
+  action Complete() {
+    try {
+      CompleteAssignment(Assignment.Single(a => a.Id == assignment), outcome);
+      completing = false;
+      outcome = "";
+    } catch (Exception ex) { problem = ex.Message; }
+    Load();
+  }
+  action Reopen() {
+    try {
+      ReopenAssignment(Assignment.Single(a => a.Id == assignment), why);
+      reopening = false;
+      why = "";
+    } catch (Exception ex) { problem = ex.Message; }
+    Load();
+  }
+  action AskToComplete() { completing = true; problem = ""; }
+  action AskToReopen() { reopening = true; problem = ""; }
+  action Dismiss() { completing = false; reopening = false; }
+
+  render {
+    Stack(gap: 5, w: "100%", label: "Assignment") {
+      if (!loaded) { SkeletonText(); }
+      if (loaded && sheet == null) {
+        EmptyState("No such assignment", body: "It does not exist, or it is not yours to see.");
+      }
+      if (sheet != null) {
+        // ── the head: what it is, where it stands, what holds it up ──
+        Stack(gap: 2) {
+          Row(gap: 2, align: Align.Center, wrap: Wrapping.Wrap) {
+            Badge(sheet.StateWords, tone: StateTone(sheet.State));
+            if (sheet.Conditions.Blocked) { Badge("Blocked", tone: Tone.Danger); }
+            if (sheet.Conditions.Overdue) { Badge("Overdue", tone: Tone.Danger); }
+            if (sheet.Conditions.Stalled) { Badge("Stalled", tone: Tone.Warning); }
+            if (sheet.Conditions.Waiting) { Badge("Waiting", tone: Tone.Default); }
+            if (sheet.Reopened > 0) { Badge(sheet.Reopened == 1 ? "Reopened once" : "Reopened " + sheet.Reopened + " times", tone: Tone.Ghost); }
+          }
+          Text(sheet.Title, fontSize: FontSize.Heading, fontWeight: FontWeight.Semibold, letterSpacing: "-0.015em");
+          Text(Byline(sheet), fontSize: FontSize.Label, color: Colors.TextMuted);
+        }
+        if (problem != "") { Alert(problem, tone: Tone.Danger); }
+
+        // On a wide screen: what is wanted and what happened on the left; where it stands, the work and the cost beside
+        // it. On a narrow one the same sections in the order somebody needs them: where it stands first, the long
+        // history last.
+        if (Layout.AtLeast(Tablet)) {
+          Row(gap: 6, align: Align.Start) {
+            Stack(gap: 5, grow: 1, minW: "0", basis: "0") {
+              AssignmentOutcome(sheet);
+              AssignmentCriteria(sheet);
+              // What other kits keep for it — its repository, its requests.
+              AssignmentPanel(assignment);
+              AssignmentHistory(sheet);
+            }
+            Stack(gap: 5, w: "38%", maxW: "440px", minW: "280px", shrink: 0) {
+              AssignmentStanding(sheet);
+              AssignmentWorkList(sheet);
+              AssignmentLinks(sheet, open);
+              AssignmentCostLine(sheet);
+              AssignmentPeople(sheet);
+              AssignmentActions(sheet, AskToComplete, AskToReopen);
+            }
+          }
+        } else {
+          Stack(gap: 5) {
+            AssignmentStanding(sheet);
+            AssignmentOutcome(sheet);
+            AssignmentCriteria(sheet);
+            AssignmentWorkList(sheet);
+            AssignmentPanel(assignment);
+            AssignmentLinks(sheet, open);
+            AssignmentCostLine(sheet);
+            AssignmentPeople(sheet);
+            AssignmentActions(sheet, AskToComplete, AskToReopen);
+            AssignmentHistory(sheet);
+          }
+        }
+
+        if (completing) {
+          Dialog("Complete the assignment", onDismiss: Dismiss, subtitle: "Every criterion is met. Say how it ended: it is kept with the assignment.") {
+            Stack(gap: 3) {
+              TextAreaField("Outcome", value: outcome, rows: 3);
+              Row(gap: 2, justify: Justify.End) {
+                Button("Cancel", onPress: Dismiss, tone: Tone.Ghost);
+                Button("Complete", onPress: Complete, tone: Tone.Primary, disabled: outcome.Trim() == "");
+              }
+            }
+          }
+        }
+        if (reopening) {
+          Dialog("Open it again", onDismiss: Dismiss, subtitle: "Every criterion that was met is put back in question. It keeps everything else.") {
+            Stack(gap: 3) {
+              TextAreaField("Why", value: why, rows: 3);
+              Row(gap: 2, justify: Justify.End) {
+                Button("Cancel", onPress: Dismiss, tone: Tone.Ghost);
+                Button("Open again", onPress: Reopen, tone: Tone.Primary, disabled: why.Trim() == "");
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+// ── the sections, each a component an app can place by itself ───────────────────────────────────────────────────────
+
+/// The outcome wanted — and, once it is closed, how it ended.
+[Composable]
+public component AssignmentOutcome(AssignmentSheet sheet) {
+  render {
+    Stack(gap: 4) {
+      Stack(gap: 2, label: "Outcome wanted") {
+        SectionLabel("Outcome wanted");
+        Text(sheet.Goal);
+        if (sheet.Scope != "") { Text(sheet.Scope, fontSize: FontSize.Label, color: Colors.TextSecondary); }
+      }
+      if (sheet.State != AssignmentState.Open) {
+        Stack(gap: 2, p: 4, rounded: Radius.Md, bg: Colors.Sunken, label: "How it ended") {
+          SectionLabel("How it ended");
+          Text(sheet.Outcome);
+          if (sheet.Limitations != "") { Text("Not established: " + sheet.Limitations, fontSize: FontSize.Label, color: Colors.TextSecondary); }
+          if (sheet.Obligations != "") { Text("Still owed: " + sheet.Obligations, fontSize: FontSize.Label, color: Colors.TextSecondary); }
+        }
+      }
+    }
+  }
+}
+
+/// What done means: each criterion, whether it is met and by what, and how many are.
+[Composable]
+public component AssignmentCriteria(AssignmentSheet sheet) {
+  render {
+    Stack(gap: 2, label: "What done means") {
+      Row(gap: 2, align: Align.Center) {
+        SectionLabel("What done means");
+        Spacer();
+        Text(sheet.Met + " of " + sheet.Criteria.Count + " met", fontSize: FontSize.Caption, color: Colors.TextMuted,
+             fontVariant: FontVariant.TabularNums);
+      }
+      if (sheet.Criteria.Count == 0) {
+        Text("Nothing says what done means yet. It cannot be completed until something does.", fontSize: FontSize.Label, color: Colors.TextMuted);
+      }
+      Stack(gap: 0, role: UiRole.List, label: "Criteria") {
+        foreach (var c in sheet.Criteria) { CriterionRow(c); }
+      }
+    }
+  }
+}
+
+/// Where an open assignment stands: every reason it is blocked, overdue, stalled or waiting, and who the next step
+/// is with. Draws nothing for a closed one.
+[Composable]
+public component AssignmentStanding(AssignmentSheet sheet) {
+  live var bad = sheet.Conditions.Blocked || sheet.Conditions.Overdue;
+  render {
+    if (sheet.State == AssignmentState.Open) {
+      Stack(gap: 2, p: 4, rounded: Radius.Md, borderW: 1, border: bad ? Colors.Danger : Colors.Border, label: "Where it stands") {
+        SectionLabel("Where it stands");
+        if (sheet.Conditions.Clear) { Text("Nothing is holding it up.", fontSize: FontSize.Label); }
+        foreach (var s in sheet.Conditions.BlockedWhy) { ReasonRow("Blocked", s, Tone.Danger); }
+        foreach (var s in sheet.Conditions.OverdueWhy) { ReasonRow("Overdue", s, Tone.Danger); }
+        if (sheet.Conditions.Stalled) { ReasonRow("Stalled", sheet.Conditions.StalledWhy, Tone.Warning); }
+        foreach (var s in sheet.Conditions.WaitingWhy) { ReasonRow("Waiting", s, Tone.Default); }
+        Text("Next step with " + string.Join(", ", sheet.Conditions.NextStepWith), fontSize: FontSize.Caption, color: Colors.TextMuted);
+      }
+    }
+  }
+}
+
+/// The work attached to it: each piece with where it stands and what it cost.
+[Composable]
+public component AssignmentWorkList(AssignmentSheet sheet) {
+  render {
+    Stack(gap: 2, label: "Work") {
+      SectionLabel("Work attached");
+      if (sheet.Work.Count == 0) { Text("Nothing is attached to it.", fontSize: FontSize.Label, color: Colors.TextMuted); }
+      Stack(gap: 0, role: UiRole.List, label: "Attached work") {
+        foreach (var w in sheet.Work) { WorkRow(w); }
+      }
+    }
+  }
+}
+
+/// The assignments it has to do with: the one it was opened under, the ones under it, what it depends on. Draws
+/// nothing when there are none. `open` makes each a link.
+[Composable]
+public component AssignmentLinks(AssignmentSheet sheet, Func<Guid, string>? open = null) {
+  render {
+    if (sheet.Links.Count > 0) {
+      Stack(gap: 2, label: "Linked assignments") {
+        SectionLabel("Linked");
+        Stack(gap: 0, role: UiRole.List, label: "Linked") {
+          foreach (var l in sheet.Links) {
+            Row(gap: 2, py: 2, align: Align.Center, borderBW: 1, border: Colors.Border, role: UiRole.ListItem, label: l.How + " " + l.Title) {
+              Text(l.How, fontSize: FontSize.Caption, color: Colors.TextMuted, whiteSpace: WhiteSpace.Nowrap);
+              if (open != null) { Link(href: open(l.Id), grow: 1, minW: "0") { Text(l.Title, fontSize: FontSize.Label); } }
+              else { Text(l.Title, fontSize: FontSize.Label, grow: 1, minW: "0"); }
+              Badge(l.State, tone: l.Open ? Tone.Default : Tone.Ghost);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/// What it has cost, against its budget when it has one.
+[Composable]
+public component AssignmentCostLine(AssignmentSheet sheet) {
+  render {
+    Stack(gap: 2, label: "Cost") {
+      SectionLabel("Cost");
+      Row(gap: 2, align: Align.Baseline) {
+        Text(sheet.CostWords, fontFamily: Font.Mono, fontVariant: FontVariant.TabularNums);
+        if (!sheet.HasBudget) { Text("no budget set", fontSize: FontSize.Caption, color: Colors.TextMuted); }
+      }
+      if (sheet.HasBudget) { ProgressBar(percent: sheet.BudgetPercent, tone: sheet.BudgetPercent >= 100 ? Tone.Danger : Tone.Primary, label: "Budget used"); }
+    }
+  }
+}
+
+/// Who is on it, and as what.
+[Composable]
+public component AssignmentPeople(AssignmentSheet sheet) {
+  render {
+    Stack(gap: 2, label: "People") {
+      SectionLabel("On it");
+      foreach (var p in sheet.People) {
+        Row(gap: 2, align: Align.Center) {
+          Text(p.Name, fontSize: FontSize.Label, grow: 1, minW: "0");
+          Text(p.Role, fontSize: FontSize.Caption, color: Colors.TextMuted);
+        }
+      }
+    }
+  }
+}
+
+/// What whoever is looking may do: complete it — with the reason beside the button while it cannot be — or, once
+/// it is closed and they are in charge, open it again.
+[Composable]
+public component AssignmentActions(AssignmentSheet sheet, Action onComplete, Action onReopen) {
+  render {
+    if (sheet.MayAct && sheet.State == AssignmentState.Open) {
+      Stack(gap: 2, align: Align.Start) {
+        Button("Complete…", onPress: onComplete, tone: Tone.Primary, disabled: !sheet.Ready);
+        if (!sheet.Ready) { Text(sheet.NotReadyWhy, fontSize: FontSize.Caption, color: Colors.TextMuted); }
+      }
+    }
+    if (sheet.InCharge && sheet.State != AssignmentState.Open) {
+      Stack(align: Align.Start) { Button("Open it again…", onPress: onReopen); }
+    }
+  }
+}
+
+/// Everything that happened, newest first. A line that established something is marked; the rest is activity.
+[Composable]
+public component AssignmentHistory(AssignmentSheet sheet) {
+  render {
+    Stack(gap: 2, label: "Activity") {
+      SectionLabel("What happened");
+      Stack(gap: 0, role: UiRole.List, label: "Activity lines") {
+        foreach (var l in sheet.Activity) { ActivityRow(l); }
+      }
+    }
+  }
+}
+
+/// One criterion: whether it has been established, and by what.
+[Composable]
+public component CriterionRow(CriterionLine c) {
+  render {
+    Row(gap: 3, py: 2, align: Align.Start, borderBW: 1, border: Colors.Border, role: UiRole.ListItem,
+        label: c.Text + (c.State == CriterionState.Met ? ", met" : c.State == CriterionState.Excepted ? ", excepted" : ", not met")) {
+      Box(pt: "3px", decorative: true) {
+        if (c.State == CriterionState.Met) { Icon(Icons.Check, size: 16, color: Colors.Success); }
+        else if (c.State == CriterionState.Excepted) { Icon(Icons.Warning, size: 16, color: Colors.Warning); }
+        else { Box(w: "14px", h: "14px", rounded: Radius.Pill, borderW: 2, border: Colors.Border) { } }
+      }
+      Stack(gap: "2px", grow: 1, minW: "0") {
+        Text(c.Text, color: c.State == CriterionState.Unmet ? Colors.OnSurface : Colors.TextSecondary);
+        if (c.Said != "") { Text(c.Said, fontSize: FontSize.Label, color: Colors.TextSecondary); }
+        if (c.State == CriterionState.Unmet && c.BoundTo != "") {
+          Text("Met when “" + c.BoundTo + "” completes", fontSize: FontSize.Caption, color: Colors.TextMuted);
+        }
+        if (c.Settled != "") { Text(c.Settled, fontSize: FontSize.Caption, color: Colors.TextMuted); }
+      }
+    }
+  }
+}
+
+/// One reason an assignment is not moving.
+[Composable]
+public component ReasonRow(string what, string why, Tone tone) {
+  render {
+    Row(gap: 2, align: Align.Start) {
+      Box(pt: "5px", decorative: true) { Lamp(tone: tone, lit: tone != Tone.Default); }
+      Text(why, fontSize: FontSize.Label, grow: 1, minW: "0");
+    }
+  }
+}
+
+/// One piece of attached work.
+[Composable]
+public component WorkRow(WorkLine w) {
+  render {
+    Stack(gap: "2px", py: 2, borderBW: 1, border: Colors.Border, role: UiRole.ListItem, label: w.Title) {
+      Row(gap: 2, align: Align.Center) {
+        Text(w.Title, fontSize: FontSize.Label, fontWeight: FontWeight.Medium, grow: 1, minW: "0");
+        if (w.Cost != "") { Text(w.Cost, fontSize: FontSize.Caption, fontFamily: Font.Mono, color: Colors.TextMuted, whiteSpace: WhiteSpace.Nowrap); }
+      }
+      Row(gap: 2, align: Align.Center, wrap: Wrapping.Wrap) {
+        if (w.Kind != "Other") { Text(w.Kind, fontSize: FontSize.Caption, color: Colors.TextMuted, whiteSpace: WhiteSpace.Nowrap); }
+        Text(w.Standing, fontSize: FontSize.Caption, grow: 1, minW: "0",
+             color: w.Blocked || w.Overdue || w.State == WorkState.Failed ? Colors.Danger : (w.State == WorkState.Done ? Colors.Success : Colors.TextSecondary));
+      }
+    }
+  }
+}
+
+/// One line of what happened. A line that was progress is marked; the rest is activity.
+[Composable]
+public component ActivityRow(ActivityLine l) {
+  render {
+    Row(gap: 3, py: 2, align: Align.Start, borderBW: 1, border: Colors.Border, role: UiRole.ListItem, label: l.Said) {
+      Box(pt: "6px", decorative: true) { Lamp(lit: l.Progress, tone: l.Progress ? Tone.Success : Tone.Default); }
+      Stack(gap: "2px", grow: 1, minW: "0") {
+        Text(l.Said, fontSize: FontSize.Label);
+        Text(l.By + $" · {l.At:d MMM HH:mm}" + (l.Branch == "" ? "" : " · " + l.Branch) + (l.Progress ? " · progress" : ""), fontSize: FontSize.Caption, color: Colors.TextMuted);
+      }
+    }
+  }
+}
+
+/// The tone an assignment's state is shown in.
+public Tone StateTone(AssignmentState state) {
+  return state == AssignmentState.Open ? Tone.Primary
+       : state == AssignmentState.Completed ? Tone.Success
+       : state == AssignmentState.CompletedByException ? Tone.Warning
+       : state == AssignmentState.Failed ? Tone.Danger : Tone.Ghost;
+}
+
+/// "Asked by Dana Holm · owned by Ravi Nair · wanted by 8 May 09:00".
+public string Byline(AssignmentSheet sheet) {
+  var line = "Asked by " + sheet.Requester;
+  if (sheet.Owner != "" && sheet.Owner != sheet.Requester) { line = line + " · owned by " + sheet.Owner; }
+  if (sheet.State == AssignmentState.Open && sheet.DueAt != null) { line = line + $" · wanted by {sheet.DueAt!:d MMM HH:mm}"; }
+  if (sheet.ClosedAt != null) { line = line + $" · closed {sheet.ClosedAt!:d MMM}"; }
+  return line;
+}

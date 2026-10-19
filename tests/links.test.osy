@@ -1,0 +1,162 @@
+// Osysharp.Assignments — assignments that have to do with one another: one opened under another, whose completion
+// meets a criterion there; one that cannot move until another is done.
+using Osysharp.Identity;
+using Osysharp.Assignments;
+using Workshop;
+
+/// A recall: every press of one model gets a new valve. One assignment for the recall, one under it per machine.
+Assignment OpenRecall() {
+  Assignment? recall = null;
+  runas (Mona) {
+    recall = OpenAssignment(new NewAssignment {
+      Title = "Recall: pilot valves on hydraulic presses",
+      Goal = "Every press we look after has the new valve.",
+      Criteria = ["The customers have been told"],
+    });
+  }
+  return recall!;
+}
+
+Assignment OpenUnder(Guid recall, string serial, Guid technician) {
+  Assignment? child = null;
+  runas (Mona) {
+    var who = Person.Single(p => p.Id == technician);
+    child = OpenAssignment(new NewAssignment {
+      Title = "New valve on " + serial, Goal = serial + " runs with the new valve.",
+      Criteria = ["The valve is fitted"], Assignees = [who],
+      Parent = Assignment.Single(a => a.Id == recall), ParentCriterion = serial + " has the new valve",
+    });
+  }
+  return child!;
+}
+
+[Test(Floor)]
+void an_assignment_opened_under_another_meets_its_criterion_there_when_it_completes() {
+  var recall = OpenRecall();
+  var first = OpenUnder(recall.Id, "P-200", Tariq.Id);
+  var second = OpenUnder(recall.Id, "P-310", Ravi.Id);
+  runas (Mona) {
+    var top = Job(recall);
+    Assert.Equal(2, top.Children.Count());
+    Assert.Equal(1, Job(first).Depth);
+    Assert.Equal(top.Id, Job(first).Root!.Id);
+    // The recall gained a criterion for each machine, bound to that machine's assignment.
+    Assert.Equal(["The customers have been told", "P-200 has the new valve", "P-310 has the new valve"],
+                 top.Criteria.OrderBy(c => c.Position).ToList().Select(c => c.Text).ToList());
+    // …which nobody ticks by hand.
+    Assert.Throws<ValidationException>(() => MeetCriterion(top.Criteria.Single(c => c.Position == 2), "I say so"));
+    MeetCriterion(top.Criteria.Single(c => c.Position == 1), "Letters sent on 4 May");
+    Assert.Throws<CriteriaUnmet>(() => CompleteAssignment(top, "Done."));
+  }
+
+  runas (Tariq) {
+    MeetCriterion(Job(first).Criteria.Single(), "Fitted and tested");
+    CompleteAssignment(Job(first), "The new valve is in.");
+  }
+  Background.Settle();
+  runas (Mona) {
+    var top = Job(recall);
+    var bound = top.Criteria.Single(c => c.Position == 2);
+    Assert.Equal(CriterionState.Met, bound.State);
+    Assert.Equal("“New valve on P-200” is completed.", bound.MetBy);
+    Assert.Equal(first.Id, bound.Evidence);
+    Assert.Equal("Assignment", bound.EvidenceType);
+    // One machine is still to do, so the recall is still open — and says which.
+    Assert.Equal("1 of 3 criteria is not met: “P-310 has the new valve”.", CompletionOf(top).Why);
+  }
+
+  runas (Ravi) {
+    MeetCriterion(Job(second).Criteria.Single(), "Fitted and tested");
+    CompleteAssignment(Job(second), "The new valve is in.");
+  }
+  Background.Settle();
+  runas (Mona) {
+    CompleteAssignment(Job(recall), "Both presses have the new valve.");
+    Assert.Equal(AssignmentState.Completed, Job(recall).State);
+  }
+}
+
+[Test(Floor)]
+void reopening_the_one_below_puts_the_criterion_above_back_in_question() {
+  var recall = OpenRecall();
+  var first = OpenUnder(recall.Id, "P-200", Tariq.Id);
+  runas (Tariq) {
+    MeetCriterion(Job(first).Criteria.Single(), "Fitted and tested");
+    CompleteAssignment(Job(first), "The new valve is in.");
+  }
+  Background.Settle();
+  runas (Mona) { Assert.Equal(CriterionState.Met, Job(recall).Criteria.Single(c => c.Position == 2).State); }
+
+  runas (Mona) { ReopenAssignment(Job(first), "The new valve leaks."); }
+  Background.Settle();
+  runas (Mona) {
+    var bound = Job(recall).Criteria.Single(c => c.Position == 2);
+    Assert.Equal(CriterionState.Unmet, bound.State);
+    Assert.Equal(1, bound.Reopened);
+    Assert.Contains("Back in question: “P-200 has the new valve” — “New valve on P-200” was opened again. (It was met by: “New valve on P-200” is completed..)",
+                    ActivityOf(Job(recall)).Select(l => l.Said).ToList());
+  }
+}
+
+[Test(Floor)]
+void whoever_is_on_an_assignment_reads_what_is_opened_under_it_and_changes_nothing_there() {
+  var recall = OpenRecall();
+  // Dana is put on the recall to follow it; the machine's assignment is opened after that, and another after.
+  runas (Mona) { AddParticipant(Job(recall), Dana, ParticipantRole.Contributor); }
+  var first = OpenUnder(recall.Id, "P-200", Tariq.Id);
+  runas (Dana) {
+    var child = Job(first);
+    Assert.Equal("New valve on P-200", child.Title);
+    Assert.Equal(ParticipantRole.Above, child.Participants.Single(p => p.Person.Id == Dana.Id).Role);
+    // She reads it; she does not work on it.
+    Assert.Denied(() => MeetCriterion(child.Criteria.Single(), "I fitted it myself"));
+    Assert.Denied(() => NoteActivity(child, ActivityKind.Note, "Just looking."));
+  }
+  // The technician on the machine does not read the recall above it.
+  runas (Tariq) {
+    Assert.Equal(1, Assignment.Count());
+    Assert.Equal(0, Assignment.Count(a => a.Id == recall.Id));
+  }
+  // Somebody put on the recall later is on what was already opened under it too.
+  runas (Mona) { AddParticipant(Job(recall), Ravi, ParticipantRole.Observer); }
+  runas (Ravi) { Assert.Equal("New valve on P-200", Job(first).Title); }
+}
+
+[Test(Floor)]
+void an_assignment_is_blocked_while_what_it_depends_on_is_not_completed() {
+  var recall = OpenRecall();
+  var fit = OpenUnder(recall.Id, "P-200", Tariq.Id);
+  Assignment? stock = null;
+  runas (Mona) {
+    stock = OpenAssignment(new NewAssignment { Title = "Buy forty valves", Goal = "Forty valves are on the shelf.", Criteria = ["Delivered and counted"] });
+    var link = LinkAssignments(Job(fit), stock!, LinkKind.DependsOn, "Needs a valve from the new batch");
+    Assert.Equal(link.Id, LinkAssignments(Job(fit), stock!, LinkKind.DependsOn).Id);
+
+    var c = ConditionsOf(Job(fit));
+    Assert.Equal(["Blocked"], c.Names());
+    Assert.Equal(["It depends on “Buy forty valves”, which is not completed."], c.BlockedWhy);
+    Assert.Equal([stock!.Id], DependenciesOf(Job(fit)).Select(a => a.Id).ToList());
+    Assert.Equal([fit.Id], DependentsOf(stock!).Select(a => a.Id).ToList());
+    // Two that would wait on each other are refused.
+    Assert.Throws<ValidationException>(() => LinkAssignments(stock!, Job(fit), LinkKind.DependsOn));
+
+    // The batch is cancelled: the dependency can no longer be satisfied as it stands, and the fitting says so.
+    CancelAssignment(stock!, "The supplier went out of business.");
+    Assert.Equal(["It depends on “Buy forty valves”, which was cancelled: that can no longer be satisfied as it stands."], ConditionsOf(Job(fit)).BlockedWhy);
+
+    // Reopened and completed, it blocks nothing.
+    ReopenAssignment(Job(stock!), "Another supplier was found.");
+    MeetCriterion(Job(stock!).Criteria.Single(), "Forty delivered, forty counted");
+    CompleteAssignment(Job(stock!), "On the shelf.");
+    Assert.True(ConditionsOf(Job(fit)).Clear);
+  }
+}
+
+[Test(Floor)]
+void nothing_is_opened_under_a_closed_assignment_and_nesting_has_a_floor() {
+  var recall = OpenRecall();
+  runas (Mona) {
+    CancelAssignment(Job(recall), "The valves were fine after all.");
+    Assert.Throws<AssignmentClosed>(() => OpenAssignment(new NewAssignment { Title = "One more", Goal = "One more.", Parent = Job(recall) }));
+  }
+}

@@ -1,0 +1,34 @@
+// The workshop's screens — the kit's assignment page as an app places it. The page is the app's; what is on it is the
+// kit's. (ui.test.osy drives it; `osy test --pixels` photographs it.)
+namespace Workshop;
+
+using Osysharp.Assignments;
+
+/// The front door: the jobs whoever is looking may read, the ones that need somebody first.
+[Title("Workshop")]
+[Route("/")]
+[Authorize]
+[Render(CSR)]
+component Home() {
+  live var jobs = Assignment.OrderBy(a => a.OpenedAt).Take(200).ToList();
+  render {
+    Stack(gap: 3, p: 5, w: "100%", maxW: "720px", mx: "auto") {
+      PageHead("Jobs");
+      if (jobs.Count == 0) { EmptyState("No jobs", body: "A job you are on appears here."); }
+      foreach (var j in jobs) { Link(href: "/jobs/" + j.Id, color: Colors.OnSurface) { Text(j.Title); } }
+    }
+  }
+}
+
+/// One job.
+[Title("Job")]
+[Route("/jobs/{id}")]
+[Authorize]
+[Render(CSR)]
+component JobPage(Guid id) {
+  render {
+    Stack(p: 5, w: "100%", maxW: "1080px", mx: "auto") {
+      AssignmentView(id, open: other => "/jobs/" + other);
+    }
+  }
+}

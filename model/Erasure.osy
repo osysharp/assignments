@@ -1,0 +1,199 @@
+// Taking a person off an assignment, and erasing what an assignment said. What was asked for, when, how it stood
+// and how it ended stay; whose it was and the words that say who it was about do not.
+namespace Osysharp.Assignments;
+
+using Osysharp.Identity;
+
+/// Who may take a person off assignments and erase what an assignment says. Nobody, until the app says:
+/// `policy ErasesAssignments => IsRecordsOfficer;`. A privacy request's own run needs nobody: it erases as the app
+/// itself.
+virtual policy ErasesAssignments => false;
+
+/// What stands where a person was, on a page and in a sentence, once they have been taken off an assignment.
+public string FormerPersonWords() { return "Somebody no longer here"; }
+
+/// A person was taken off an assignment, or what it said was erased.
+[Event("Assignment erased")]
+public sealed class AssignmentErased {
+  public Assignment Assignment;
+  /// True when what it SAID was erased or scrubbed; false when a person who worked on it was taken off it.
+  public bool Words = false;
+  public string Why = "";
+}
+
+/// How what an assignment says is erased.
+public class AssignmentScrub {
+  /// The words that say who it is about — a name, an address, an order number. Each is replaced by `StandIn`
+  /// wherever it stands in the assignment's text, whatever its capitals.
+  public List<string> Words = [];
+  /// What stands in their place — "a former customer".
+  public string StandIn = "somebody no longer here";
+  /// Replace every sentence whole instead: nothing anybody wrote is left, only that it was written.
+  public bool Blank = false;
+  /// Why — kept with the assignment.
+  public string Why = "";
+}
+
+/// Every assignment a person is on, asked for, owns, or did something on — each once, oldest first.
+[SuppressWarning("cost-unbounded-read")]   // one person's assignments — what taking them off reaches
+public List<Assignment> AssignmentsOf(Principal person) {
+  List<Assignment> found = [];
+  foreach (var seat in AssignmentParticipant.Where(p => p.Person == person).ToList()) { AddOnce(found, seat.Assignment); }
+  foreach (var a in Assignment.Where(a => a.Requester == person || a.Owner == person || a.ClosedBy == person).ToList()) { AddOnce(found, a); }
+  foreach (var line in AssignmentActivity.Where(l => l.By == person).ToList()) { AddOnce(found, line.Assignment); }
+  foreach (var c in AssignmentCriterion.Where(c => c.SettledBy == person).ToList()) { AddOnce(found, c.Assignment); }
+  foreach (var w in AssignmentWork.Where(w => w.WaitingOn == person || w.OpenedBy == person).ToList()) { AddOnce(found, w.Assignment); }
+  foreach (var l in AssignmentLink.Where(l => l.By == person).ToList()) { AddOnce(found, l.From); }
+  return found.OrderBy(a => a.OpenedAt).ToList();
+}
+
+void AddOnce(List<Assignment> found, Assignment a) {
+  if (!found.Any(x => x.Id == a.Id)) { found.Add(a); }
+}
+
+/// ⭐ TAKE A PERSON OFF AN ASSIGNMENT: they are no longer on it, it is no longer theirs — asked by, owned by, closed
+/// by, waited on — and every line they wrote, every criterion they settled, reads `Somebody no longer here`. Their
+/// name and their address are replaced by `standIn` wherever the assignment's own sentences carry them ("Ines is on
+/// it as an assignee." becomes "somebody no longer here is on it as an assignee.").
+///
+/// The assignment stays, with what was asked for, its criteria and where each stands, its work, every line of its
+/// activity and how it ended. An open assignment whose owner is taken off falls to whoever asked; one with neither is
+/// in the hands of whoever oversees assignments.
+[Server, Authorize(ErasesAssignments)]
+public void TakePersonOffAssignment(Assignment a, Principal person, string standIn, string why) {
+  if (why.Trim() == "") { throw new ValidationException("Say why they are taken off it: that much is kept."); }
+  List<string> words = [];
+  if (person.DisplayName.Trim() != "") { words.Add(person.DisplayName.Trim()); }
+  if (person.Email.Trim() != "") { words.Add(person.Email.Trim()); }
+  var stand = standIn.Trim() == "" ? "somebody no longer here" : standIn.Trim();
+
+  foreach (var seat in AssignmentParticipant.Where(p => p.Assignment == a && p.Person == person).ToList()) { seat.Delete(); }
+  if (a.Requester == person) { a.Requester = null; }
+  if (a.Owner == person) { a.Owner = null; }
+  if (a.ClosedBy == person) { a.ClosedBy = null; }
+  a.Title = Clip(Scrubbed(a.Title, words, stand), 200);
+  a.Goal = Clip(Scrubbed(a.Goal, words, stand), 4000);
+  a.Scope = Clip(Scrubbed(a.Scope, words, stand), 4000);
+  a.Outcome = Clip(Scrubbed(a.Outcome, words, stand), 4000);
+  a.Limitations = Clip(Scrubbed(a.Limitations, words, stand), 4000);
+  a.Obligations = Clip(Scrubbed(a.Obligations, words, stand), 4000);
+
+  foreach (var c in AssignmentCriterion.Where(c => c.Assignment == a).ToList()) {
+    if (c.SettledBy == person) { c.SettledBy = null; c.SettledByFormer = true; }
+    c.Text = Clip(Scrubbed(c.Text, words, stand), 600);
+    c.MetBy = Clip(Scrubbed(c.MetBy, words, stand), 1000);
+    c.ExceptionWhy = Clip(Scrubbed(c.ExceptionWhy, words, stand), 1000);
+  }
+  foreach (var w in AssignmentWork.Where(w => w.Assignment == a).ToList()) {
+    if (w.WaitingOn == person) { w.WaitingOn = null; }
+    if (w.OpenedBy == person) { w.OpenedBy = null; }
+    w.Title = Clip(Scrubbed(w.Title, words, stand), 300);
+    w.WaitingFor = Clip(Scrubbed(w.WaitingFor, words, stand), 300);
+    w.BlockedWhy = Clip(Scrubbed(w.BlockedWhy, words, stand), 600);
+    w.Result = Clip(Scrubbed(w.Result, words, stand), 2000);
+  }
+  foreach (var line in AssignmentActivity.Where(l => l.Assignment == a).ToList()) {
+    if (line.By == person) { line.By = null; line.ByFormer = true; }
+    line.Said = Clip(Scrubbed(line.Said, words, stand), 2000);
+  }
+  foreach (var link in AssignmentLink.Where(l => l.From == a).ToList()) {
+    if (link.By == person) { link.By = null; }
+    link.Why = Clip(Scrubbed(link.Why, words, stand), 600);
+  }
+  Raise(new AssignmentErased { Assignment = a, Why = Clip(why.Trim(), 300) });
+}
+
+/// ⭐ ERASE WHAT AN ASSIGNMENT SAYS about the person it is about. With `how.Words`, each of those words — their
+/// name, their address, an order number — is replaced by `how.StandIn` in every sentence of the assignment: its
+/// title, goal and scope, each criterion and what met it, each piece of attached work and its result, every line of
+/// its activity, how it ended. With `how.Blank`, every sentence is replaced whole.
+///
+/// What stays either way is that the work was done: when it was asked for and by whom, each criterion and whether it
+/// was met, each piece of work and how it ended, the kind and time of every line, what it cost, and how it closed.
+/// Refused while the assignment is open — close it first.
+[Server, Authorize(ErasesAssignments)]
+public void AnonymiseAssignment(Assignment a, AssignmentScrub how) {
+  if (how.Why.Trim() == "") { throw new ValidationException("Say why it is erased: that much is kept."); }
+  if (a.State == AssignmentState.Open) {
+    throw new AssignmentRefused($"“{a.Title}” is open. Close it — complete, cancel or fail it — and then erase what it says.");
+  }
+  var stand = how.StandIn.Trim() == "" ? "somebody no longer here" : how.StandIn.Trim();
+  var blank = how.Blank;
+  var words = how.Words;
+  a.Title = blank ? "An assignment about " + stand : Clip(Scrubbed(a.Title, words, stand), 200);
+  a.Goal = blank ? "Erased." : Clip(Scrubbed(a.Goal, words, stand), 4000);
+  a.Scope = blank ? "" : Clip(Scrubbed(a.Scope, words, stand), 4000);
+  a.Outcome = blank ? (a.Outcome == "" ? "" : "Erased.") : Clip(Scrubbed(a.Outcome, words, stand), 4000);
+  a.Limitations = blank ? "" : Clip(Scrubbed(a.Limitations, words, stand), 4000);
+  a.Obligations = blank ? "" : Clip(Scrubbed(a.Obligations, words, stand), 4000);
+  foreach (var c in AssignmentCriterion.Where(c => c.Assignment == a).ToList()) {
+    c.Text = blank ? "An erased criterion" : Clip(Scrubbed(c.Text, words, stand), 600);
+    c.MetBy = blank ? (c.MetBy == "" ? "" : "Erased.") : Clip(Scrubbed(c.MetBy, words, stand), 1000);
+    c.ExceptionWhy = blank ? (c.ExceptionWhy == "" ? "" : "Erased.") : Clip(Scrubbed(c.ExceptionWhy, words, stand), 1000);
+  }
+  foreach (var w in AssignmentWork.Where(w => w.Assignment == a).ToList()) {
+    w.Title = blank ? "An erased piece of work" : Clip(Scrubbed(w.Title, words, stand), 300);
+    w.WaitingFor = blank ? "" : Clip(Scrubbed(w.WaitingFor, words, stand), 300);
+    w.BlockedWhy = blank ? "" : Clip(Scrubbed(w.BlockedWhy, words, stand), 600);
+    w.Result = blank ? (w.Result == "" ? "" : "Erased.") : Clip(Scrubbed(w.Result, words, stand), 2000);
+  }
+  foreach (var line in AssignmentActivity.Where(l => l.Assignment == a).ToList()) {
+    line.Said = blank ? "Erased." : Clip(Scrubbed(line.Said, words, stand), 2000);
+  }
+  foreach (var link in AssignmentLink.Where(l => l.From == a).ToList()) {
+    link.Why = blank ? "" : Clip(Scrubbed(link.Why, words, stand), 600);
+  }
+  a.AnonymisedAt = DateTime.UtcNow;
+  a.ErasedWhy = Clip(how.Why.Trim(), 300);
+  Raise(new AssignmentErased { Assignment = a, Words = true, Why = a.ErasedWhy });
+}
+
+/// `text` with every one of `words` replaced by `standIn`, whatever its capitals. The longest words go first, so a
+/// full name is replaced before the first name inside it.
+public string Scrubbed(string text, List<string> words, string standIn) {
+  if (text == "") { return text; }
+  var result = text;
+  foreach (var word in words.Where(w => w.Trim().Length >= 2).OrderByDescending(w => w.Trim().Length).ToList()) {
+    result = ReplacedAnyCase(result, word.Trim(), standIn);
+  }
+  return result;
+}
+
+string ReplacedAnyCase(string text, string word, string standIn) {
+  var lower = text.ToLower();
+  var find = word.ToLower();
+  var result = "";
+  var from = 0;
+  var at = lower.IndexOf(find, from);
+  while (at >= 0) {
+    result = result + text.Substring(from, at - from) + standIn;
+    from = at + find.Length;
+    at = lower.IndexOf(find, from);
+  }
+  return result + text.Substring(from);
+}
+
+/// Whether whoever is calling may erase assignments: the app itself — a process, a privacy request's own run — or a
+/// person the app's `ErasesAssignments` policy admits. What a package built on assignments asks before it calls an
+/// erasure of this one's as part of an erasure of its own.
+public bool MayEraseAssignments() {
+  var me = Security.CurrentUserId;
+  if (me == null) { return true; }
+  var who = Principal.FirstOrDefault(p => p.Id == me);
+  return who != null && Security.Authorize(who!, ErasesAssignments);
+}
+
+/// ⭐ ERASE WORDS FROM AN ASSIGNMENT'S ACTIVITY: each of `words` is replaced by `standIn` in every line — the title
+/// of an item of its repository that was itself erased, a name. Unlike `AnonymiseAssignment` it works on an open
+/// assignment and touches nothing but the activity's sentences. Answers how many lines changed.
+[Server, Authorize(ErasesAssignments)]
+public int EraseWordsFromActivity(Assignment a, List<string> words, string standIn, string why) {
+  if (why.Trim() == "") { throw new ValidationException("Say why they are erased: that much is kept."); }
+  var stand = standIn.Trim() == "" ? "something that was erased" : standIn.Trim();
+  var changed = 0;
+  foreach (var line in AssignmentActivity.Where(l => l.Assignment == a).ToList()) {
+    var said = Clip(Scrubbed(line.Said, words, stand), 2000);
+    if (said != line.Said) { line.Said = said; changed = changed + 1; }
+  }
+  return changed;
+}

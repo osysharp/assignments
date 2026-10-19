@@ -1,0 +1,145 @@
+// The four conditions of an open assignment — waiting, blocked, overdue, stalled — worked out from what is attached
+// to it, what it depends on, its dates and its two clocks. They stand beside its state, and more than one can hold.
+namespace Osysharp.Assignments;
+
+using Osysharp.Identity;
+
+/// ⭐ THE CONDITIONS OF AN ASSIGNMENT, each with its reasons in words.
+///
+/// - **Waiting** — an answer or an event it expects is pending, inside the time allowed for it.
+/// - **Blocked** — it needs something that is not available: a piece of work that cannot move, or an assignment it
+///   depends on that is not completed.
+/// - **Overdue** — a date has passed without what was wanted by it: the assignment's own, or a piece of work's.
+/// - **Stalled** — nothing has been established for longer than it allows. Reminders and retries do not count.
+///
+/// A closed assignment has none.
+public class AssignmentConditions {
+  public bool Waiting = false;
+  public bool Blocked = false;
+  public bool Overdue = false;
+  public bool Stalled = false;
+  /// Why each holds — one sentence per thing it is waiting on, blocked by, overdue for; one for the stall.
+  public List<string> WaitingWhy = [];
+  public List<string> BlockedWhy = [];
+  public List<string> OverdueWhy = [];
+  public string StalledWhy = "";
+  /// Who the next step is with, when it is with somebody: the people open work waits on, else its owner.
+  public List<string> NextStepWith = [];
+  /// The nearest date still ahead — the assignment's or a piece of work's — and null when there is none.
+  public DateTime? NextDue;
+  /// When something was last established, and when anything last happened.
+  public DateTime LastProgressAt;
+  public DateTime LastActivityAt;
+  /// When it becomes stalled if nothing is established before then.
+  public DateTime? StallsAt;
+  /// The branches that have gone quiet while others moved: nothing established on them for as long as a stall takes.
+  public List<string> StalledBranches = [];
+
+  /// None of the four holds.
+  public bool Clear => !Waiting && !Blocked && !Overdue && !Stalled;
+  /// The conditions that hold, as words — ["Waiting", "Overdue"].
+  public List<string> Names() {
+    List<string> names = [];
+    if (Waiting) { names.Add("Waiting"); }
+    if (Blocked) { names.Add("Blocked"); }
+    if (Overdue) { names.Add("Overdue"); }
+    if (Stalled) { names.Add("Stalled"); }
+    return names;
+  }
+}
+
+/// ⭐ THE CONDITIONS OF `a`, now.
+///
+///     var c = ConditionsOf(a);
+///     if (c.Stalled) { Escalate(a, c.StalledWhy); }
+public AssignmentConditions ConditionsOf(Assignment a) { return ConditionsAt(a, DateTime.UtcNow); }
+
+/// The conditions `a` would have at `at` if nothing else happened before then.
+public AssignmentConditions ConditionsAt(Assignment a, DateTime at) {
+  var c = new AssignmentConditions { LastProgressAt = a.LastProgressAt, LastActivityAt = a.LastActivityAt };
+  if (a.State != AssignmentState.Open) { return c; }
+
+  foreach (var work in a.Work.Where(w => w.State == WorkState.Open).OrderBy(w => w.Number).ToList()) {
+    var who = work.WaitingOn == null ? "" : NameOf(work.WaitingOn);
+    var what = work.WaitingFor != "" ? work.WaitingFor : work.Title;
+    if (who != "" && !c.NextStepWith.Contains(who)) { c.NextStepWith.Add(who); }
+    if (work.Blocked) {
+      c.Blocked = true;
+      c.BlockedWhy.Add($"“{work.Title}” is blocked: {work.BlockedWhy}");
+      continue;
+    }
+    if (work.DueAt != null && work.DueAt! < at) {
+      c.Overdue = true;
+      c.OverdueWhy.Add($"“{work.Title}” was wanted by {WhenWords(work.DueAt)}" + (who == "" ? "." : $", from {who}."));
+      continue;
+    }
+    c.Waiting = true;
+    c.WaitingWhy.Add((who == "" ? "Waiting for " : $"Waiting on {who} for ") + what + (work.DueAt == null ? "." : $", by {WhenWords(work.DueAt)}."));
+    if (work.DueAt != null && (c.NextDue == null || work.DueAt! < c.NextDue!)) { c.NextDue = work.DueAt; }
+  }
+
+  foreach (var on in DependenciesOf(a)) {
+    if (on.State == AssignmentState.Completed || on.State == AssignmentState.CompletedByException) { continue; }
+    c.Blocked = true;
+    c.BlockedWhy.Add(on.State == AssignmentState.Open
+      ? $"It depends on “{on.Title}”, which is not completed."
+      : $"It depends on “{on.Title}”, which was {StateWords(on.State)}: that can no longer be satisfied as it stands.");
+  }
+
+  if (a.DueAt != null) {
+    if (a.DueAt! < at) {
+      c.Overdue = true;
+      c.OverdueWhy.Add($"Its outcome was wanted by {WhenWords(a.DueAt)}.");
+    } else if (c.NextDue == null || a.DueAt! < c.NextDue!) { c.NextDue = a.DueAt; }
+  }
+
+  var allowed = StalledAfterOf(a);
+  c.StallsAt = a.LastProgressAt + allowed;
+  if (c.StallsAt! <= at) {
+    c.Stalled = true;
+    c.StalledWhy = $"Nothing has been established since {WhenWords(a.LastProgressAt)}; it allows {SpanWords(allowed)}."
+      + (a.LastActivityAt > a.LastProgressAt ? $" (There was activity as late as {WhenWords(a.LastActivityAt)}, and none of it was progress.)" : "");
+  }
+  foreach (var branch in BranchesOf(a)) {
+    var last = branch.LastProgressAt ?? a.OpenedAt;
+    var open = a.Work.Any(w => w.Branch == branch.Branch && w.State == WorkState.Open);
+    if (open && last + allowed <= at) { c.StalledBranches.Add(branch.Branch); }
+  }
+
+  if (c.NextStepWith.Count == 0) { c.NextStepWith.Add(a.Owner == null && a.Requester == null ? FormerPersonWords() : NameOf(a.Owner ?? a.Requester)); }
+  return c;
+}
+
+/// How long `a` may go without progress before it is stalled.
+public TimeSpan StalledAfterOf(Assignment a) {
+  return a.StalledAfterMinutes > 0 ? TimeSpan.FromMinutes(a.StalledAfterMinutes) : App.Setting<AssignmentsSetup>().StalledAfter;
+}
+
+/// Why an assignment is not moving, in one paragraph a person or a coordinator reads — every reason of every
+/// condition that holds. "" when none does.
+public string WhyNotMoving(Assignment a) {
+  var c = ConditionsOf(a);
+  List<string> lines = [];
+  foreach (var s in c.BlockedWhy) { lines.Add(s); }
+  foreach (var s in c.OverdueWhy) { lines.Add(s); }
+  if (c.Stalled) { lines.Add(c.StalledWhy); }
+  foreach (var s in c.WaitingWhy) { lines.Add(s); }
+  return string.Join(" ", lines);
+}
+
+/// The open assignments that hold a condition — what somebody who oversees them, or is on them, looks at first.
+/// Each reader gets the ones they may read.
+public List<Assignment> AssignmentsNeedingAttention() {
+  List<Assignment> found = [];
+  foreach (var a in Assignment.Where(x => x.State == AssignmentState.Open).OrderBy(x => x.LastProgressAt).ToList()) {
+    var c = ConditionsOf(a);
+    if (c.Blocked || c.Overdue || c.Stalled) { found.Add(a); }
+  }
+  return found;
+}
+
+string SpanWords(TimeSpan span) {
+  if (span.TotalDays >= 1 && span.TotalDays == Math.Round(span.TotalDays)) { return span.TotalDays == 1 ? "a day" : $"{(int)span.TotalDays} days"; }
+  if (span.TotalHours >= 1) { return span.TotalHours == 1 ? "an hour" : $"{Math.Round(span.TotalHours, 1)} hours"; }
+  return $"{(int)Math.Round(span.TotalMinutes)} minutes";
+}

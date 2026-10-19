@@ -1,0 +1,88 @@
+// Assignments that have to do with one another: one that cannot move until another is done, one that follows on
+// from another, two that are about the same thing. (One opened UNDER another is `Assignment.Parent`.)
+namespace Osysharp.Assignments;
+
+using Osysharp.Identity;
+
+/// How one assignment has to do with another. ⚠ Appended, never inserted: an enum is stored by position.
+public enum LinkKind {
+  /// `From` cannot reach its outcome until `To` is completed: it is blocked while `To` is open, and stuck if `To`
+  /// was cancelled or failed.
+  [Label("Depends on")] DependsOn,
+  /// `From` continues what `To` started — a replacement, or the next round.
+  [Label("Follows on from")] FollowsOn,
+  /// They are about the same thing.
+  [Label("Related to")] RelatedTo,
+}
+
+/// One link between two assignments.
+[Unique(From, To, Kind)]
+public entity AssignmentLink {
+  [Required, Immutable, Index] Assignment From;
+  [Required, Immutable, Index] Assignment To;
+  [Immutable] LinkKind Kind = LinkKind.RelatedTo;
+  /// Why, in words — "both draw on the Malmö stock".
+  [MaxLength(600), Classification(Personal.Content)] string Why = "";
+  [Classification(Personal.Identity)] Principal? By;
+  [Immutable] DateTime At = DateTime.UtcNow;
+
+  security {
+    // Whoever is on either end reads the link.
+    allow read when IsAuthenticated where AssignmentParticipant.Any(p => (p.Assignment.Id == From.Id || p.Assignment.Id == To.Id) && p.Person == user);
+    allow read when OverseesAssignments || ErasesAssignments;
+    allow create, delete when IsAuthenticated where AssignmentParticipant.Any(p => p.Assignment.Id == From.Id && p.Person == user && p.Acts);
+    allow create, delete when OverseesAssignments;
+    deny create except via LinkAssignments;
+    deny delete except via UnlinkAssignments;
+    // A link is never rewritten: why, and by whom, change only when a person is taken off or the words are erased.
+    allow update when ErasesAssignments;
+    deny update Why except via TakePersonOffAssignment, AnonymiseAssignment;
+    deny update By except via TakePersonOffAssignment;
+  }
+}
+
+/// ⭐ LINK TWO ASSIGNMENTS. `LinkKind.DependsOn` makes `from` wait on `to`: `from` is blocked until `to` is
+/// completed. A dependency that would run in a circle is refused.
+///
+///     LinkAssignments(nordicRecovery, stockAllocation, LinkKind.DependsOn, "Needs the Malmö stock decision");
+[Server, Authorize(IsAuthenticated)]
+public AssignmentLink LinkAssignments(Assignment from, Assignment to, LinkKind kind = LinkKind.RelatedTo, string why = "") {
+  if (from == to) { throw new ValidationException("An assignment is not linked to itself."); }
+  var there = AssignmentLink.FirstOrDefault(l => l.From == from && l.To == to && l.Kind == kind);
+  if (there != null) { return there!; }
+  if (kind == LinkKind.DependsOn && DependsOnDeep(to, from, 0)) {
+    throw new ValidationException($"“{to.Title}” already depends on “{from.Title}”: the two would wait on each other.");
+  }
+  var link = new AssignmentLink { From = from, To = to, Kind = kind, Why = Clip(why.Trim(), 600), By = Me() };
+  var words = kind == LinkKind.DependsOn ? "Depends on" : kind == LinkKind.FollowsOn ? "Follows on from" : "Related to";
+  RecordActivity(from, new ActivityNote { Kind = ActivityKind.Linked, Said = $"{words} “{to.Title}”" + (link.Why == "" ? "." : ": " + link.Why), Reference = to.Id, ReferenceType = "Assignment" });
+  return link;
+}
+
+/// Take a link away.
+[Server, Authorize(IsAuthenticated)]
+public void UnlinkAssignments(Assignment from, Assignment to, LinkKind kind) {
+  var link = AssignmentLink.FirstOrDefault(l => l.From == from && l.To == to && l.Kind == kind);
+  if (link == null) { return; }
+  link!.Delete();
+  RecordActivity(from, new ActivityNote { Kind = ActivityKind.Linked, Said = $"No longer linked to “{to.Title}”.", Reference = to.Id, ReferenceType = "Assignment" });
+}
+
+/// What `a` depends on.
+public List<Assignment> DependenciesOf(Assignment a) {
+  return AssignmentLink.Where(l => l.From == a && l.Kind == LinkKind.DependsOn).ToList().Select(l => l.To).ToList();
+}
+
+/// What depends on `a`.
+public List<Assignment> DependentsOf(Assignment a) {
+  return AssignmentLink.Where(l => l.To == a && l.Kind == LinkKind.DependsOn).ToList().Select(l => l.From).ToList();
+}
+
+/// Whether `from` depends on `on`, directly or through others.
+bool DependsOnDeep(Assignment from, Assignment on, int depth) {
+  if (depth > 20) { return false; }
+  foreach (var next in DependenciesOf(from)) {
+    if (next == on || DependsOnDeep(next, on, depth + 1)) { return true; }
+  }
+  return false;
+}

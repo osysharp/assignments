@@ -1,0 +1,206 @@
+// A workshop that services machines. A customer reports a press that faults now and then; the workshop owns getting
+// it to run clean — the diagnosis, the quote the customer must approve, the part, the visit, and the second look when
+// the first repair does not hold.
+namespace Workshop;
+
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Assignments;
+using Osysharp.Workflow;
+
+[Role] enum WorkshopRole { Authenticator, Desk, Technician, Manager, Customer, Records }
+
+partial entity RoleGrant { security { allow read when IsAuthenticated; } }
+
+policy IsDesk       => RoleGrant.Any(g => g.Member == user && g.Role == WorkshopRole.Desk);
+policy IsTechnician => RoleGrant.Any(g => g.Member == user && g.Role == WorkshopRole.Technician);
+policy IsManager    => RoleGrant.Any(g => g.Member == user && g.Role == WorkshopRole.Manager);
+policy IsRecords    => RoleGrant.Any(g => g.Member == user && g.Role == WorkshopRole.Records);
+
+// The kit's questions, answered: the desk asks for work, the manager oversees all of it and is the one who may close
+// a job short of what done means.
+policy OpensAssignments            => IsDesk || IsManager;
+policy OverseesAssignments         => IsManager;
+policy AcceptsAssignmentExceptions => IsManager;
+// The records clerk takes a person off the jobs they were on, and erases what a job says about a customer.
+policy ErasesAssignments           => IsRecords;
+// The manager reads what the models cost and sets what they may.
+policy ReadsModelUsage   => IsManager;
+policy ManagesModelSpend => IsManager;
+
+/// Somebody at the workshop, or one of its customers.
+entity Person : Principal {
+  security {
+    allow read when IsAuthenticated || IsAuthenticator;
+    allow create when IsAuthenticator;
+  }
+}
+
+/// A machine the workshop looks after.
+entity Machine {
+  [Required, Unique, MaxLength(60)] string Serial;
+  [MaxLength(200)] string Model = "";
+  /// The job the workshop has open on it — the app's own record pointing at an assignment.
+  Assignment? Job;
+  security { allow read, create, update when IsAuthenticated; }
+}
+
+// ── opening a job ───────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Open the job for a machine that faults: the outcome wanted, and what done means.
+public Assignment OpenRepair(Machine machine, Person technician, DateTime? dueAt = null) {
+  var job = OpenAssignment(new NewAssignment {
+    Title = "Press " + machine.Serial + " faults intermittently",
+    Goal = "The press runs a full shift without faulting.",
+    Scope = "Diagnosis, parts and one visit. A rebuild is a new job.",
+    Criteria = ["The cause is found", "The customer approved the cost", "The press ran clean for a shift"],
+    Assignees = [technician],
+    DueAt = dueAt,
+  });
+  machine.Job = job;
+  return job;
+}
+
+/// A criterion of a job, by its place in the list.
+public AssignmentCriterion Criterion(Assignment job, int position) {
+  return job.Criteria.Single(c => c.Position == position);
+}
+
+// ── a quote the customer must approve — a process that waits for a person ───────────────────────────────────────────
+
+public enum QuoteStage { Asked, Ordering, Approved, Declined }
+
+/// What a repair will cost, put to the customer.
+entity RepairQuote {
+  [Required] Assignment Job;
+  [Required] Person Customer;
+  decimal Amount;
+  QuoteStage Stage;
+  /// How many times the part was ordered. It is ordered once.
+  int PartsOrdered = 0;
+  security { allow read, create when IsAuthenticated; }
+}
+
+/// Put a quote to the customer, and attach the wait for their answer to the job.
+public RepairQuote AskForApproval(Assignment job, Person customer, decimal amount, DateTime dueAt) {
+  var quote = new RepairQuote { Job = job, Customer = customer, Amount = amount };
+  AttachWork(job, new WorkAttachment {
+    Kind = WorkKind.Request, Key = "quote", Title = "Ask the customer to approve the cost", Subject = quote.Id,
+    SubjectType = "RepairQuote", WaitingOn = customer, WaitingFor = "their yes or no to " + amount + " EUR", DueAt = dueAt,
+  });
+  return quote;
+}
+
+/// The customer's answer.
+public void AnswerQuote(RepairQuote quote, bool yes) { QuoteApproval.For(quote).Customer.Answer(yes); }
+
+/// The quote's own process: it waits for the customer however long that takes, and then goes on by itself.
+workflow QuoteApproval {
+  Tracks    = RepairQuote.Stage;
+  Autostart = true;
+  Initial   = Asked;
+
+  event Answer(bool yes);
+
+  state Asked {
+    subscribe Answer(bool yes) as Customer { Assignee = this.Item.Customer; }
+    on Answer(bool yes) {
+      when (!yes) { goto Declined; }
+      default { goto Ordering; }
+    }
+  }
+
+  state Ordering {
+    enter {
+      var job = this.Item.Job;
+      // Ordered once: a run that is repeated finds the order already recorded on the job.
+      if (DoneFor(job, "part-order") == null) {
+        this.Item.PartsOrdered = this.Item.PartsOrdered + 1;
+        RecordDone(job, "part-order", "Order the replacement valve", "Ordered from the supplier");
+      }
+      var wait = WorkOf(job, "quote");
+      if (wait != null) { CloseWork(wait!, WorkState.Done, "The customer approved " + this.Item.Amount + " EUR."); }
+      MeetCriterion(Criterion(job, 2), "The customer approved the quote", evidence: this.Item.Id, evidenceType: "RepairQuote");
+      goto Approved;
+    }
+  }
+
+  terminal success Approved { }
+  terminal cancel  Declined { Message = "the customer said no"; }
+}
+
+// ── a model call for a job ──────────────────────────────────────────────────────────────────────────────────────────
+
+/// A summary of where a job stands, written by a model and charged to the job.
+public string Summarise(Assignment job) {
+  var answer = await Assignments.Complete(job, "Summarise where this job stands: " + job.Goal, "status summary");
+  NoteActivity(job, ActivityKind.StatusSummary, "A summary was written.");
+  return answer;
+}
+
+// ── what app code is not able to do ─────────────────────────────────────────────────────────────────────────────────
+
+// The workshop means to leave the kit's rows as the kit guards them; the functions below are there to be refused.
+[SuppressWarning("IMPORTED_ENTITY_HAS_NO_POLICY")] partial entity AssignmentCriterion { }
+[SuppressWarning("IMPORTED_ENTITY_HAS_NO_POLICY")] partial entity AssignmentActivity { }
+[SuppressWarning("IMPORTED_ENTITY_HAS_NO_POLICY")] partial entity AssignmentParticipant { }
+[SuppressWarning("IMPORTED_ENTITY_HAS_NO_POLICY")] partial entity AssignmentWork { }
+
+/// A job made without asking for it.
+public void ForgeAssignment(Person who) {
+  new Assignment { Title = "Made up", Goal = "Nothing", Requester = who };
+}
+
+/// A job closed by writing its state.
+public void ForceClosed(Assignment job) {
+  job.State = AssignmentState.Completed;
+  job.Outcome = "Trust me.";
+}
+
+/// A criterion ticked by writing its state.
+public void TickCriterion(AssignmentCriterion criterion) {
+  criterion.State = CriterionState.Met;
+  criterion.MetBy = "Because.";
+}
+
+/// A line of activity made up, and the progress clock moved by hand.
+public void ForgeProgress(Assignment job) {
+  new AssignmentActivity { Assignment = job, Kind = ActivityKind.Progress, Progress = true, Said = "Going well." };
+  job.LastProgressAt = DateTime.UtcNow;
+}
+
+/// Somebody put on a job without `AddParticipant`.
+public void ForgeSeat(Assignment job, Person who) {
+  new AssignmentParticipant { Assignment = job, Person = who, Role = ParticipantRole.Owner, Acts = true };
+}
+
+/// A piece of work's cost turned back.
+public void RewriteCost(AssignmentWork work) { work.CostMicros = 0; }
+
+/// A piece of work attached the proper way — and then its cost written by hand before the request ends.
+public void AttachThenRewrite(Assignment job) {
+  var work = AttachWork(job, new WorkAttachment { Kind = WorkKind.Other, Key = "padded", Title = "A visit" });
+  work.CostMicros = 5000000;
+}
+
+/// A criterion added the proper way — and ticked by hand in the same breath.
+public void AddThenTick(Assignment job) {
+  var criterion = AddCriterion(job, "The floor is swept");
+  criterion.State = CriterionState.Met;
+  criterion.MetBy = "Because.";
+}
+
+/// A line of activity rewritten, and somebody's seat taken away, by hand.
+public void RewriteActivity(AssignmentActivity line) { line.Said = "Nothing happened."; }
+public void DisownActivity(AssignmentActivity line) { line.By = null; }
+public void UnseatByHand(AssignmentParticipant seat) { seat.Delete(); }
+
+/// Every sentence an assignment holds, as whoever is reading may read it — its own words, its criteria, its work
+/// and every line of its activity, in one text.
+public string EverythingItSays(Assignment job) {
+  var all = job.Title + "|" + job.Goal + "|" + job.Scope + "|" + job.Outcome + "|" + job.Limitations + "|" + job.Obligations + "\n";
+  foreach (var c in job.Criteria.ToList()) { all = all + c.Text + "|" + c.MetBy + "|" + c.ExceptionWhy + "\n"; }
+  foreach (var w in job.Work.ToList()) { all = all + w.Title + "|" + w.WaitingFor + "|" + w.BlockedWhy + "|" + w.Result + "\n"; }
+  foreach (var l in job.Activity.ToList()) { all = all + l.Said + "\n"; }
+  return all;
+}

@@ -1,0 +1,164 @@
+// Everything an assignment's page shows, read in one go — as whoever is looking.
+namespace Osysharp.Assignments;
+
+using Osysharp.Identity;
+using Osysharp.Llm;
+
+/// One criterion as a page shows it.
+public class CriterionLine {
+  public Guid Id;
+  public int Position = 0;
+  public string Text = "";
+  public CriterionState State = CriterionState.Unmet;
+  /// What met it, or why an exception was accepted.
+  public string Said = "";
+  /// Who settled it and when — "Tariq Aziz, 14 May".
+  public string Settled = "";
+  /// The assignment whose completion meets it, when it is bound to one.
+  public string BoundTo = "";
+}
+
+/// One piece of attached work as a page shows it.
+public class WorkLine {
+  public Guid Id;
+  public string Title = "";
+  public string Kind = "";
+  public WorkState State = WorkState.Open;
+  public bool Blocked = false;
+  public bool Overdue = false;
+  /// Where it stands, in a few words — "Waiting on Carl Lind · wanted by 5 May", "Done: valve replaced".
+  public string Standing = "";
+  public string Cost = "";
+}
+
+/// Somebody on the assignment.
+public class PersonLine {
+  public string Name = "";
+  public string Role = "";
+}
+
+/// Another assignment this one has to do with.
+public class LinkLine {
+  public Guid Id;
+  /// How — "Opened under", "Under it", "Depends on", "Needed by", "Follows on from", "Related to".
+  public string How = "";
+  public string Title = "";
+  public string State = "";
+  public bool Open = false;
+}
+
+/// ⭐ AN ASSIGNMENT AS ITS PAGE SHOWS IT — what `AssignmentView` draws, and what an app's own page reads when it
+/// draws the assignment its own way.
+public class AssignmentSheet {
+  public Guid Id;
+  public string Title = "";
+  public string Goal = "";
+  public string Scope = "";
+  public AssignmentState State = AssignmentState.Open;
+  public string StateWords = "";
+  public string Requester = "";
+  public string Owner = "";
+  public DateTime OpenedAt;
+  public DateTime? DueAt;
+  public DateTime? ClosedAt;
+  public string Outcome = "";
+  public string Limitations = "";
+  public string Obligations = "";
+  public int Reopened = 0;
+
+  public AssignmentConditions Conditions = new AssignmentConditions();
+  public List<CriterionLine> Criteria = [];
+  public int Met = 0;
+  /// Whether it can be completed now, and what stands in the way when it cannot.
+  public bool Ready = false;
+  public string NotReadyWhy = "";
+
+  public List<WorkLine> Work = [];
+  public List<PersonLine> People = [];
+  public List<LinkLine> Links = [];
+  public List<ActivityLine> Activity = [];
+
+  /// What it has cost, in words — "$0.0016 of $0.05" — and how much of its budget that is, 0 to 100.
+  public string CostWords = "";
+  public int BudgetPercent = 0;
+  public bool HasBudget = false;
+
+  /// Whether whoever is looking works on it, and whether they are in charge of it.
+  public bool MayAct = false;
+  public bool InCharge = false;
+}
+
+/// ⭐ THE SHEET OF ONE ASSIGNMENT, as whoever asks may read it. Null when it is not theirs to read.
+public AssignmentSheet? SheetOf(Guid assignment, int activity = 30) {
+  var a = Assignment.FirstOrDefault(x => x.Id == assignment);
+  if (a == null) { return null; }
+  var row = a!;
+  var me = Security.CurrentUserId;
+  var sheet = new AssignmentSheet {
+    Id = row.Id, Title = row.Title, Goal = row.Goal, Scope = row.Scope, State = row.State, StateWords = row.State.Label,
+    Requester = row.Requester == null ? FormerPersonWords() : NameOf(row.Requester), Owner = row.Owner == null ? "" : NameOf(row.Owner),
+    OpenedAt = row.OpenedAt, DueAt = row.DueAt, ClosedAt = row.ClosedAt,
+    Outcome = row.Outcome, Limitations = row.Limitations, Obligations = row.Obligations, Reopened = row.Reopened,
+  };
+  var now = DateTime.UtcNow;
+  sheet.Conditions = ConditionsOf(row);
+
+  foreach (var c in row.Criteria.OrderBy(c => c.Position).ToList()) {
+    var line = new CriterionLine { Id = c.Id, Position = c.Position, Text = c.Text, State = c.State };
+    if (c.State == CriterionState.Met) { line.Said = c.MetBy; sheet.Met = sheet.Met + 1; }
+    if (c.State == CriterionState.Excepted) { line.Said = "Exception: " + c.ExceptionWhy; }
+    if (c.SettledAt != null) { line.Settled = (c.SettledByFormer ? FormerPersonWords() : NameOf(c.SettledBy)) + $", {c.SettledAt!:d MMM}"; }
+    if (c.MetWhen != null) { line.BoundTo = c.MetWhen!.Title; }
+    sheet.Criteria.Add(line);
+  }
+  var completion = CompletionOf(row);
+  sheet.Ready = completion.Ready;
+  sheet.NotReadyWhy = completion.Why;
+
+  foreach (var w in row.Work.OrderBy(w => w.Number).ToList()) {
+    var line = new WorkLine { Id = w.Id, Title = w.Title, Kind = w.Kind.Label, State = w.State, Blocked = w.Blocked };
+    line.Overdue = w.State == WorkState.Open && w.DueAt != null && w.DueAt! < now;
+    if (w.State == WorkState.Open) {
+      var who = w.WaitingOn == null ? "" : NameOf(w.WaitingOn);
+      line.Standing = w.Blocked ? "Blocked: " + w.BlockedWhy
+        : (who == "" ? "Open" : "Waiting on " + who) + (w.DueAt == null ? "" : $" · wanted by {w.DueAt!:d MMM HH:mm}");
+    } else {
+      line.Standing = w.State.Label + (w.Result == "" ? "" : ": " + w.Result);
+    }
+    line.Cost = w.CostMicros == 0 ? "" : "$" + Dollars(w.CostMicros);
+    sheet.Work.Add(line);
+  }
+
+  foreach (var p in row.Participants.OrderBy(p => p.Since).ToList()) {
+    if (p.Role == ParticipantRole.Above) { continue; }
+    sheet.People.Add(new PersonLine { Name = NameOf(p.Person), Role = p.Role.Label });
+    if (me != null && p.Person.Id == me && p.Acts) { sheet.MayAct = true; }
+  }
+  sheet.InCharge = InChargeOf(row);
+  if (sheet.InCharge) { sheet.MayAct = true; }
+
+  if (row.Parent != null) { sheet.Links.Add(LinkTo(row.Parent!.Id, "Opened under")); }
+  foreach (var child in row.Children.OrderBy(c => c.OpenedAt).ToList()) { sheet.Links.Add(LinkTo(child.Id, "Under it")); }
+  foreach (var l in AssignmentLink.Where(l => l.From == row && l.Kind == LinkKind.DependsOn).ToList()) { sheet.Links.Add(LinkTo(l.To.Id, "Depends on")); }
+  foreach (var l in AssignmentLink.Where(l => l.To == row && l.Kind == LinkKind.DependsOn).ToList()) { sheet.Links.Add(LinkTo(l.From.Id, "Needed by")); }
+  foreach (var l in AssignmentLink.Where(l => l.From == row && l.Kind != LinkKind.DependsOn).ToList()) {
+    sheet.Links.Add(LinkTo(l.To.Id, l.Kind == LinkKind.FollowsOn ? "Follows on from" : "Related to"));
+  }
+
+  var cost = CostOf(row);
+  sheet.HasBudget = cost.BudgetMicros > 0;
+  sheet.CostWords = "$" + Dollars(cost.TotalMicros) + (sheet.HasBudget ? " of $" + Dollars(cost.BudgetMicros) : "");
+  sheet.BudgetPercent = sheet.HasBudget ? (int)Math.Min(100, cost.TotalMicros * 100 / cost.BudgetMicros) : 0;
+
+  sheet.Activity = ActivityOf(row, activity);
+  return sheet;
+}
+
+/// One linked assignment, by its id. The other end of a link is not always the reader's to read — somebody on a job
+/// opened under another is not on the one above it. The link is theirs to see; the other assignment is not, and
+/// the line says so and names nothing.
+LinkLine LinkTo(Guid id, string how) {
+  var other = Assignment.FirstOrDefault(x => x.Id == id);
+  if (other == null) { return new LinkLine { Id = id, How = how, Title = "an assignment you are not on", State = "Not yours to read", Open = false }; }
+  return new LinkLine { Id = id, How = how, Title = other!.Title, State = other!.State.Label, Open = other!.State == AssignmentState.Open };
+}

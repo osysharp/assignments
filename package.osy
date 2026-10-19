@@ -1,0 +1,46 @@
+// Osysharp.Assignments — a piece of work somebody asked for, owned until its outcome is reached.
+//
+//     var a = OpenAssignment(new NewAssignment {
+//       Title = "Order 1042 has not arrived",
+//       Goal  = "The customer has the order, or their money back, before Friday.",
+//       Criteria = ["The parcel is delivered or the order is refunded", "The customer has been told"],
+//       DueAt = friday,
+//     });
+//     …
+//     MeetCriterion(a.Criteria[0], "Refunded in full", evidence: refund.Id);
+//     CompleteAssignment(a, "Refunded; the customer was told by mail.");     // refused while a criterion is unmet
+//
+// ⚑ THE ASSIGNMENT OWNS THE OUTCOME. An agent's run, a process, a question put to a person, work handed to another
+//   system — each is attached to it (`AttachWork`) and any of them may fail, be replaced or take a month. The
+//   assignment is what stays: who asked, what done means, what has been established, what it has cost.
+//
+// ⚑ DONE IS ITS CRITERIA, NEVER "EVERYTHING ATTACHED HAS FINISHED". It completes when every criterion is met — each
+//   with what met it — or when somebody the app trusts with that accepts a written exception for the ones that are
+//   not. It can be reopened, and keeps everything it had.
+//
+// ⚑ PROGRESS IS NOT ACTIVITY. A reminder, a retry and a status summary move the last-activity time. Only something
+//   established — a criterion met, a piece of work finished, a note of progress that points at what it rests on —
+//   moves the last-progress time. Waiting, blocked, overdue and stalled are worked out from those, each with its reason.
+//
+// ⚑ THE APP SAYS THREE THINGS, each nobody's until it does:
+//     policy OpensAssignments            => IsStaff;     // asks for work
+//     policy OverseesAssignments         => IsLead;      // reads and acts on every assignment
+//     policy AcceptsAssignmentExceptions => IsManager;   // closes one with a criterion unmet, in writing
+package Osysharp.Assignments {
+  version     "1.1.0";
+  minPlatform "0.14.0";
+  summary     "durable assignments: a piece of work somebody asked for, owned until its outcome is reached — completion by declared criteria (or a written exception), re-openable with its record; agent runs, processes, requests and handoffs attached to it; progress told apart from activity; waiting, blocked, overdue and stalled worked out with their reasons; linked and nested assignments; and what it has cost.";
+
+  model "model/**/*.osy";
+  tests "tests";
+  // The personal data its own fields hold (`[Classification(Personal.X)]`): who asked for it, owns it and worked on it,
+  // and what was written on it — which can be about anybody.
+  personal Identity;
+  personal Content;
+  // Who asked, who owns it, who is on it.
+  use Osysharp.Identity@0;
+  // What it has spent on models: the assignment is a scope calls are charged to and a limit they are held to.
+  use Osysharp.Llm@2;
+  // The assignment's own views — themed by the app.
+  use Osysharp.Ui;
+}

@@ -1,0 +1,331 @@
+// What done means: the criteria an assignment declares, each met with what met it — and the only ways it closes.
+namespace Osysharp.Assignments;
+
+using Osysharp.Identity;
+
+/// Where one criterion stands. ⚠ Appended, never inserted: an enum is stored by position.
+public enum CriterionState {
+  /// Not established yet.
+  [Label("Unmet")] Unmet,
+  /// Established — `MetBy` says by what.
+  [Label("Met")] Met,
+  /// Not met, and somebody the app trusts with that accepted it in writing — `ExceptionWhy` says why.
+  [Label("Excepted")] Excepted,
+}
+
+/// ⭐ ONE THING THAT MUST BE TRUE FOR AN ASSIGNMENT TO BE DONE — a sentence, and whether it has been established.
+///
+/// Met with what met it (`MeetCriterion`): words, and the evidence or the decision it rests on. Put back in question
+/// when that stops being true (`ReopenCriterion`). Or bound to another assignment (`MetWhen`), and then met when that
+/// one completes and unmet again when it is reopened.
+public entity AssignmentCriterion {
+  [Required, Immutable, Index] Assignment Assignment;
+  /// Its place in the list, from 1.
+  int Position = 0;
+  /// What must be true.
+  [Required, MaxLength(600), Classification(Personal.Content)] string Text;
+  /// A name code can find it by — "refunded-or-delivered". "": it is found by its row.
+  [Immutable, MaxLength(80)] string Key = "";
+  CriterionState State = CriterionState.Unmet;
+  /// What met it, in words.
+  [MaxLength(1000), Classification(Personal.Content)] string MetBy = "";
+  /// What that rests on: the id of a piece of evidence, a decision or a finished piece of work, and what kind of
+  /// thing it is — "RepositoryItem", "AgentTask", "Order".
+  Guid? Evidence;
+  [MaxLength(200)] string EvidenceType = "";
+  /// The assignment whose completion meets this criterion. Null: somebody says when it is met.
+  [Immutable, Index] Assignment? MetWhen;
+  /// Why an exception was accepted for it.
+  [MaxLength(1000), Classification(Personal.Content)] string ExceptionWhy = "";
+  /// When it was last settled — met or excepted — and by whom. Nobody: the app itself — or, when `SettledByFormer`,
+  /// somebody who has since been taken off the assignment.
+  DateTime? SettledAt;
+  [Classification(Personal.Identity)] Principal? SettledBy;
+  bool SettledByFormer = false;
+  /// How many times it was put back in question after it had been settled.
+  int Reopened = 0;
+
+  security {
+    allow read when IsAuthenticated where AssignmentParticipant.Any(p => p.Assignment.Id == Assignment.Id && p.Person == user);
+    allow read when OverseesAssignments || ErasesAssignments;
+    // Made only inside this package's own functions (the `deny create` below), each of which writes the assignment
+    // itself — so whoever may not change the assignment makes nothing on it.
+    allow create when IsAuthenticated where AssignmentParticipant.Any(p => p.Assignment.Id == Assignment.Id && p.Person == user && p.Acts);
+    allow create when OverseesAssignments;
+    allow update when IsAuthenticated where AssignmentParticipant.Any(p => p.Assignment.Id == Assignment.Id && p.Person == user && p.Acts);
+    allow update when OverseesAssignments || ErasesAssignments;
+    deny create except via OpenAssignment, AddCriterion;
+    deny update State, Evidence, EvidenceType, SettledAt, Reopened except via SettleCriterion;
+    // What met it in words, and who settled it, also change when a person is taken off or its words are erased.
+    deny update MetBy, ExceptionWhy except via SettleCriterion, TakePersonOffAssignment, AnonymiseAssignment;
+    deny update SettledBy except via SettleCriterion, TakePersonOffAssignment;
+    deny update SettledByFormer except via TakePersonOffAssignment;
+    deny update Text except via TakePersonOffAssignment, AnonymiseAssignment;
+    deny update Position;
+    deny delete;
+  }
+}
+
+/// Add a criterion to an open assignment — what else must be true for it to be done. `key` is a name code can find
+/// it by; `metWhen` binds it to another assignment, whose completion then meets it.
+[Server, Authorize(IsAuthenticated)]
+public AssignmentCriterion AddCriterion(Assignment a, string text, string key = "", Assignment? metWhen = null) {
+  RequireOpen(a);
+  if (text.Trim() == "") { throw new ValidationException("A criterion says what must be true, in a sentence."); }
+  if (key != "" && a.Criteria.Any(c => c.Key == key)) {
+    throw new ValidationException($"“{a.Title}” already has a criterion called “{key}”.");
+  }
+  var last = 0;
+  foreach (var c in a.Criteria.ToList()) { if (c.Position > last) { last = c.Position; } }
+  var criterion = new AssignmentCriterion { Assignment = a, Position = last + 1, Text = text.Trim(), Key = key, MetWhen = metWhen };
+  RecordActivity(a, new ActivityNote { Kind = ActivityKind.CriterionAdded, Said = "Added to what done means: " + criterion.Text, Reference = criterion.Id, ReferenceType = "AssignmentCriterion" });
+  // An assignment that was already complete when it was bound has already met it.
+  if (metWhen != null && (metWhen!.State == AssignmentState.Completed || metWhen!.State == AssignmentState.CompletedByException)) {
+    SettleCriterion(criterion, new CriterionSettling {
+      State = CriterionState.Met, MetBy = $"“{metWhen!.Title}” is completed.", Evidence = metWhen!.Id, EvidenceType = "Assignment",
+    });
+  }
+  return criterion;
+}
+
+/// The criterion of `a` called `key`.
+public AssignmentCriterion CriterionOf(Assignment a, string key) {
+  var found = a.Criteria.FirstOrDefault(c => c.Key == key);
+  if (found == null) { throw new ValidationException($"“{a.Title}” has no criterion called “{key}”."); }
+  return found!;
+}
+
+/// ⭐ A CRITERION IS MET — say by what. `metBy` is words a person reads ("Refunded in full on 12 March");
+/// `evidence` is the id of what it rests on, and `evidenceType` what kind of thing that is.
+///
+///     MeetCriterion(criterion, "The carrier's scan shows it delivered", evidence: scan.Id, evidenceType: "RepositoryItem");
+[Server, Authorize(IsAuthenticated)]
+public void MeetCriterion(AssignmentCriterion criterion, string metBy, Guid? evidence = null, string evidenceType = "") {
+  RequireOpen(criterion.Assignment);
+  if (metBy.Trim() == "") { throw new ValidationException("Say what met it: a criterion is never just ticked."); }
+  if (criterion.MetWhen != null) {
+    throw new ValidationException($"This criterion is met when “{criterion.MetWhen!.Title}” completes, and not by hand.");
+  }
+  SettleCriterion(criterion, new CriterionSettling { State = CriterionState.Met, MetBy = metBy.Trim(), Evidence = evidence, EvidenceType = evidenceType });
+}
+
+/// Put a criterion back in question: what met it no longer holds. It keeps what it said before in the assignment's
+/// activity.
+[Server, Authorize(IsAuthenticated)]
+public void ReopenCriterion(AssignmentCriterion criterion, string why) {
+  RequireOpen(criterion.Assignment);
+  if (why.Trim() == "") { throw new ValidationException("Say why it is back in question: it is kept with the assignment."); }
+  if (criterion.State == CriterionState.Unmet) { return; }
+  SettleCriterion(criterion, new CriterionSettling { State = CriterionState.Unmet, Why = why.Trim() });
+}
+
+/// ⭐ ACCEPT AN EXCEPTION for a criterion that is not met — in writing, by somebody the app trusts with that
+/// (`AcceptsAssignmentExceptions`). The assignment can then be completed, and says it was completed by exception.
+[Server, Authorize(AcceptsAssignmentExceptions)]
+public void AcceptException(AssignmentCriterion criterion, string why) {
+  RequireOpen(criterion.Assignment);
+  if (why.Trim() == "") { throw new ValidationException("An exception is accepted in writing: say why."); }
+  if (criterion.State == CriterionState.Met) { throw new ValidationException("This criterion is met; there is nothing to except."); }
+  SettleCriterion(criterion, new CriterionSettling { State = CriterionState.Excepted, Why = why.Trim() });
+}
+
+/// How a criterion is settled.
+public class CriterionSettling {
+  public CriterionState State = CriterionState.Met;
+  public string MetBy = "";
+  public Guid? Evidence;
+  public string EvidenceType = "";
+  /// Why it is excepted, or why it is back in question.
+  public string Why = "";
+}
+
+/// The one place a criterion's standing changes, with its line of activity.
+[Server, Authorize(IsAuthenticated)]
+internal void SettleCriterion(AssignmentCriterion criterion, CriterionSettling how) {
+  var a = criterion.Assignment;
+  var me = Me();
+  if (how.State == CriterionState.Unmet) {
+    var was = criterion.State == CriterionState.Met ? "met by: " + criterion.MetBy : "excepted: " + criterion.ExceptionWhy;
+    criterion.State = CriterionState.Unmet;
+    criterion.MetBy = "";
+    criterion.Evidence = null;
+    criterion.EvidenceType = "";
+    criterion.ExceptionWhy = "";
+    criterion.SettledAt = null;
+    criterion.SettledBy = null;
+    criterion.Reopened = criterion.Reopened + 1;
+    RecordActivity(a, new ActivityNote {
+      Kind = ActivityKind.CriterionReopened, Reference = criterion.Id, ReferenceType = "AssignmentCriterion",
+      Said = $"Back in question: “{criterion.Text}” — {how.Why} (It was {was}.)",
+    });
+    Raise(new AssignmentCriterionReopened { Criterion = criterion, Why = how.Why });
+    return;
+  }
+  var reopened = criterion.Reopened;
+  criterion.State = how.State;
+  criterion.MetBy = how.State == CriterionState.Met ? Clip(how.MetBy, 1000) : "";
+  criterion.Evidence = how.State == CriterionState.Met ? how.Evidence : null;
+  criterion.EvidenceType = how.State == CriterionState.Met ? how.EvidenceType : "";
+  criterion.ExceptionWhy = how.State == CriterionState.Excepted ? Clip(how.Why, 1000) : "";
+  criterion.SettledAt = DateTime.UtcNow;
+  criterion.SettledBy = me;
+  criterion.Reopened = reopened;
+  if (how.State == CriterionState.Met) {
+    RecordActivity(a, new ActivityNote {
+      Kind = ActivityKind.CriterionMet, Progress = true,
+      Reference = how.Evidence ?? criterion.Id, ReferenceType = how.Evidence == null ? "AssignmentCriterion" : how.EvidenceType,
+      Said = $"Met: “{criterion.Text}” — {criterion.MetBy}",
+    });
+    Raise(new AssignmentCriterionMet { Criterion = criterion });
+  } else {
+    RecordActivity(a, new ActivityNote {
+      Kind = ActivityKind.ExceptionAccepted, Progress = true, Reference = criterion.Id, ReferenceType = "AssignmentCriterion",
+      Said = $"Exception accepted by {NameOf(me)} for “{criterion.Text}”: {criterion.ExceptionWhy}",
+    });
+    Raise(new AssignmentExceptionAccepted { Criterion = criterion, Why = criterion.ExceptionWhy });
+  }
+}
+
+// ── closing, and opening again ──────────────────────────────────────────────────────────────────────────────────────
+
+/// Whether an assignment can be completed, and what stands in the way.
+public class Completion {
+  /// Every criterion is met or excepted — and there is at least one.
+  public bool Ready = false;
+  /// Whether completing it now would be by exception.
+  public bool ByException = false;
+  public List<AssignmentCriterion> Unmet = [];
+  /// What stands in the way, as a sentence — "2 of 3 criteria are not met: …". "" when nothing does.
+  public string Why = "";
+}
+
+/// Whether `a` can be completed now.
+public Completion CompletionOf(Assignment a) {
+  var criteria = a.Criteria.OrderBy(c => c.Position).ToList();
+  var result = new Completion();
+  if (criteria.Count == 0) {
+    result.Why = "It says nothing about what done means yet: add a criterion.";
+    return result;
+  }
+  List<string> names = [];
+  foreach (var c in criteria) {
+    if (c.State == CriterionState.Unmet) { result.Unmet.Add(c); names.Add("“" + c.Text + "”"); }
+    if (c.State == CriterionState.Excepted) { result.ByException = true; }
+  }
+  result.Ready = result.Unmet.Count == 0;
+  if (!result.Ready) {
+    result.Why = result.Unmet.Count == 1
+      ? $"1 of {criteria.Count} criteria is not met: {names[0]}."
+      : $"{result.Unmet.Count} of {criteria.Count} criteria are not met: {string.Join(", ", names)}.";
+  }
+  return result;
+}
+
+/// ⭐ COMPLETE AN ASSIGNMENT. Refused (`CriteriaUnmet`) while any criterion is neither met nor excepted — however
+/// much of the work attached to it has finished. `outcome` says how it ended; `limitations` what could not be
+/// established; `obligations` what somebody still owes after it.
+[Server, Authorize(IsAuthenticated)]
+public void CompleteAssignment(Assignment a, string outcome, string limitations = "", string obligations = "") {
+  RequireOpen(a);
+  var completion = CompletionOf(a);
+  if (!completion.Ready) { throw new CriteriaUnmet($"“{a.Title}” cannot be completed. {completion.Why}"); }
+  if (outcome.Trim() == "") { throw new ValidationException("Say how it ended: the outcome is kept with the assignment."); }
+  CloseAssignmentAs(a, completion.ByException ? AssignmentState.CompletedByException : AssignmentState.Completed, outcome, limitations, obligations);
+  Raise(new AssignmentCompleted { Assignment = a, ByException = completion.ByException });
+}
+
+/// Call an assignment off. Whoever asked, whoever owns it and whoever oversees assignments may. The work attached
+/// to it that is still open is closed as cancelled; whoever runs that work hears `AssignmentCancelled`.
+[Server, Authorize(IsAuthenticated)]
+public void CancelAssignment(Assignment a, string why) {
+  RequireOpen(a);
+  RequireInCharge(a, "call it off");
+  if (why.Trim() == "") { throw new ValidationException("Say why it is called off: it is kept with the assignment."); }
+  foreach (var work in a.Work.Where(w => w.State == WorkState.Open).ToList()) {
+    CloseWork(work, WorkState.Cancelled, "The assignment was called off.");
+  }
+  CloseAssignmentAs(a, AssignmentState.Cancelled, why, "", "");
+  Raise(new AssignmentCancelled { Assignment = a, Why = why.Trim() });
+}
+
+/// Close an assignment as failed: it could not be done. What was established — its criteria as they stand, its
+/// activity, everything attached — stays with it. `limitations` says what is left unanswered.
+[Server, Authorize(IsAuthenticated)]
+public void FailAssignment(Assignment a, string why, string limitations = "") {
+  RequireOpen(a);
+  if (why.Trim() == "") { throw new ValidationException("Say why it could not be done: it is kept with the assignment."); }
+  CloseAssignmentAs(a, AssignmentState.Failed, why, limitations, "");
+  Raise(new AssignmentFailed { Assignment = a, Why = why.Trim() });
+}
+
+/// The one place an assignment closes.
+[Server, Authorize(IsAuthenticated)]
+internal void CloseAssignmentAs(Assignment a, AssignmentState state, string outcome, string limitations, string obligations) {
+  a.State = state;
+  a.Outcome = Clip(outcome.Trim(), 4000);
+  a.Limitations = Clip(limitations.Trim(), 4000);
+  a.Obligations = Clip(obligations.Trim(), 4000);
+  a.ClosedAt = DateTime.UtcNow;
+  a.ClosedBy = Me();
+  var kind = state == AssignmentState.Cancelled ? ActivityKind.Cancelled : state == AssignmentState.Failed ? ActivityKind.Failed : ActivityKind.Completed;
+  var word = state == AssignmentState.Cancelled ? "Called off" : state == AssignmentState.Failed ? "Failed"
+           : state == AssignmentState.CompletedByException ? "Completed by exception" : "Completed";
+  RecordActivity(a, new ActivityNote { Kind = kind, Progress = state != AssignmentState.Cancelled && state != AssignmentState.Failed, Said = $"{word}: {a.Outcome}" });
+}
+
+/// ⭐ OPEN A CLOSED ASSIGNMENT AGAIN — the outcome did not hold. It keeps everything: its criteria, its activity,
+/// what is attached to it and what it cost. `noLongerMet` are the criteria put back in question; with none named,
+/// every criterion that was met by hand is.
+///
+///     ReopenAssignment(repair, "The press faulted again after two days.", [CriterionOf(repair, "runs-clean")]);
+[Server, Authorize(IsAuthenticated)]
+public void ReopenAssignment(Assignment a, string why, List<AssignmentCriterion>? noLongerMet = null) {
+  if (a.State == AssignmentState.Open) { return; }
+  RequireInCharge(a, "open it again");
+  if (why.Trim() == "") { throw new ValidationException("Say why it is opened again: it is kept with the assignment."); }
+  if (a.Parent != null && a.Parent!.State != AssignmentState.Open) {
+    throw new AssignmentClosed($"“{a.Title}” was opened under “{a.Parent!.Title}”, which is closed. Reopen that one first.");
+  }
+  var was = StateWords(a.State);
+  var outcome = a.Outcome;
+  a.State = AssignmentState.Open;
+  a.Outcome = "";
+  a.Limitations = "";
+  a.Obligations = "";
+  a.ClosedAt = null;
+  a.ClosedBy = null;
+  a.Reopened = a.Reopened + 1;
+  RecordActivity(a, new ActivityNote { Kind = ActivityKind.Reopened, Said = $"Opened again: {why.Trim()} (It was {was}: {outcome})" });
+  List<AssignmentCriterion> back = [];
+  if (noLongerMet != null) { foreach (var c in noLongerMet!) { back.Add(c); } }
+  if (back.Count == 0) {
+    foreach (var c in a.Criteria.Where(c => c.State == CriterionState.Met && c.MetWhen == null).ToList()) { back.Add(c); }
+  }
+  foreach (var c in back) {
+    if (c.Assignment != a) { throw new ValidationException("That criterion belongs to another assignment."); }
+    if (c.State != CriterionState.Unmet) { SettleCriterion(c, new CriterionSettling { State = CriterionState.Unmet, Why = why.Trim() }); }
+  }
+  Raise(new AssignmentReopened { Assignment = a, Why = why.Trim() });
+}
+
+// ── an assignment bound to a criterion of another ───────────────────────────────────────────────────────────────────
+
+/// An assignment that completes meets the criteria bound to it.
+[On, Order(10)]
+internal void ACompletedAssignmentMeetsWhatWaitsOnIt(AssignmentCompleted e) {
+  foreach (var c in AssignmentCriterion.Where(c => c.MetWhen == e.Assignment && c.State == CriterionState.Unmet).ToList()) {
+    if (c.Assignment.State != AssignmentState.Open) { continue; }
+    SettleCriterion(c, new CriterionSettling {
+      State = CriterionState.Met, MetBy = $"“{e.Assignment.Title}” is completed.", Evidence = e.Assignment.Id, EvidenceType = "Assignment",
+    });
+  }
+}
+
+/// An assignment that is opened again puts the criteria bound to it back in question.
+[On, Order(10)]
+internal void AReopenedAssignmentUnmeetsWhatItMet(AssignmentReopened e) {
+  foreach (var c in AssignmentCriterion.Where(c => c.MetWhen == e.Assignment && c.State == CriterionState.Met).ToList()) {
+    if (c.Assignment.State != AssignmentState.Open) { continue; }
+    SettleCriterion(c, new CriterionSettling { State = CriterionState.Unmet, Why = $"“{e.Assignment.Title}” was opened again." });
+  }
+}

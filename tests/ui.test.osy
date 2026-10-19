@@ -1,0 +1,129 @@
+// Osysharp.Assignments — the assignment's page, driven as a person: what is wanted, what done means and how far that
+// is, why it is not moving, the work attached to it — and completing it from the page, refused while a criterion is
+// unmet. `osy test --pixels` photographs each state, wide and on a phone (`Ui.Shot`).
+using Osysharp.Identity;
+using Osysharp.Assignments;
+using Workshop;
+
+/// A job in the middle of its life: one criterion met, a quote out with the customer and overdue, a visit blocked,
+/// a part ordered, and nothing established for three days.
+Guid AJobThatIsStuck() {
+  TestClock.Set(new DateTime(2026, 5, 4, 9, 0, 0));
+  Guid id = Guid.Empty;
+  runas (Dana) { id = OpenRepair(Machine.Single(m => m.Serial == "P-200"), Tariq, new DateTime(2026, 5, 8, 17, 0, 0)).Id; }
+  runas (Tariq) {
+    var a = JobBy(id);
+    MeetCriterion(Criterion(a, 1), "A worn pilot valve, seen on the pressure log", evidence: Evidence(), evidenceType: "ServiceLog");
+    RecordDone(a, "part-quote", "Ask the supplier for a price", "480 EUR, in stock");
+    var visit = AttachWork(a, new WorkAttachment { Kind = WorkKind.Other, Key = "visit-1", Title = "Fit the new valve on site", WaitingOn = Tariq });
+    BlockWork(visit, "The site is closed until the safety inspection is done.");
+    CountWorkCost(AttachWork(a, new WorkAttachment { Kind = WorkKind.AgentTask, Key = "logs", Title = "Read the pressure logs" }), 4200);
+    CloseWork(WorkOf(a, "logs")!, WorkState.Done, "The fault follows a cold start.");
+  }
+  runas (Dana) {
+    AskForApproval(JobBy(id), Carl, 480m, new DateTime(2026, 5, 5, 9, 0, 0));
+    SetAssignmentBudget(JobBy(id), 0.02m);
+  }
+  TestClock.Set(new DateTime(2026, 5, 7, 14, 30, 0));
+  runas (Tariq) { NoteActivity(JobBy(id), ActivityKind.Reminder, "Reminded Carl Lind that his answer is wanted."); }
+  return id;
+}
+
+[Test(Floor)]
+void an_assignments_page_says_what_is_wanted_what_done_means_and_why_it_is_not_moving() {
+  var id = AJobThatIsStuck();
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Tariq);
+  Ui.Visit("/jobs/" + id);
+
+  Assert.Visible("Press P-200 faults intermittently", within: "Assignment");
+  Assert.Visible("The press runs a full shift without faulting.", within: "Outcome wanted");
+  // What done means, and how far that is.
+  Assert.Visible("1 of 3 met", within: "What done means");
+  Assert.Visible("A worn pilot valve, seen on the pressure log", within: "What done means");
+  Assert.Visible("The press ran clean for a shift", within: "What done means");
+  // Why it is not moving — each condition with its reason.
+  Assert.Visible("Blocked", within: "Assignment");
+  Assert.Visible("Overdue", within: "Assignment");
+  Assert.Visible("Stalled", within: "Assignment");
+  Assert.Visible("“Fit the new valve on site” is blocked: The site is closed until the safety inspection is done.", within: "Where it stands");
+  Assert.Visible("“Ask the customer to approve the cost” was wanted by 5 May 2026 09:00 UTC, from Carl Lind.", within: "Where it stands");
+  Assert.Visible("Next step with Tariq Aziz, Carl Lind", within: "Where it stands");
+  // The work attached to it, and what it has cost.
+  Assert.Visible("Read the pressure logs", within: "Work");
+  Assert.Visible("Done: The fault follows a cold start.", within: "Work");
+  Assert.Visible("$0.0042 of $0.02", within: "Cost");
+  // What happened — the reminder is there, and is not progress.
+  Assert.Visible("Reminded Carl Lind that his answer is wanted.", within: "Activity");
+  // It cannot be completed, and the page says why.
+  Assert.Disabled("Complete…");
+  Assert.Visible("2 of 3 criteria are not met", within: "Assignment");
+  Ui.Shot("assignment-stuck-wide");
+
+  Ui.Viewport(390, 844);
+  Ui.Visit("/jobs/" + id);
+  Assert.Visible("1 of 3 met", within: "What done means");
+  Assert.Visible("Where it stands");
+  Assert.NoOverflow();
+  Ui.Shot("assignment-stuck-phone");
+}
+
+[Test(Floor)]
+void an_assignment_is_completed_from_its_page_and_opened_again_by_whoever_is_in_charge() {
+  TestClock.Set(new DateTime(2026, 5, 14, 16, 0, 0));
+  Guid id = Guid.Empty;
+  runas (Dana) { id = OpenRepair(Machine.Single(m => m.Serial == "P-200"), Tariq).Id; }
+  runas (Tariq) {
+    var a = JobBy(id);
+    MeetCriterion(Criterion(a, 1), "A worn pilot valve");
+    MeetCriterion(Criterion(a, 2), "Approved by phone, noted by the desk");
+    MeetCriterion(Criterion(a, 3), "Eight hours on 14 May with no fault");
+  }
+
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Tariq);
+  Ui.Visit("/jobs/" + id);
+  Assert.Visible("3 of 3 met", within: "What done means");
+  Assert.Visible("Nothing is holding it up.", within: "Where it stands");
+  Assert.Enabled("Complete…");
+  Ui.Click("Complete…");
+  Assert.Dialog("Complete the assignment");
+  Ui.Fill("Outcome", "The valve was replaced and the press ran clean for a shift.");
+  Ui.Shot("assignment-completing-wide");
+  Ui.Click("Complete");
+
+  Assert.Visible("Completed", within: "Assignment");
+  Assert.Visible("The valve was replaced and the press ran clean for a shift.", within: "How it ended");
+  Assert.Hidden("Complete…");
+  // Tariq did the work; opening it again is for whoever is in charge.
+  Assert.Hidden("Open it again…");
+  runas (Dana) { Assert.Equal(AssignmentState.Completed, JobBy(id).State); }
+  Ui.Shot("assignment-completed-wide");
+
+  Ui.SignInAs(Dana);
+  Ui.Visit("/jobs/" + id);
+  Ui.Click("Open it again…");
+  Ui.Fill("Why", "The press faulted again after two days.");
+  Ui.Click("Open again");
+  Assert.Visible("Open", within: "Assignment");
+  Assert.Visible("Reopened once", within: "Assignment");
+  Assert.Visible("0 of 3 met", within: "What done means");
+  Assert.Visible("Opened again: The press faulted again after two days.", within: "Activity");
+  runas (Dana) { Assert.Equal(1, JobBy(id).Reopened); }
+
+  Ui.Viewport(390, 844);
+  Ui.Visit("/jobs/" + id);
+  Assert.NoOverflow();
+  Ui.Shot("assignment-reopened-phone");
+}
+
+[Test(Floor)]
+void somebody_who_is_not_on_an_assignment_is_shown_nothing_of_it() {
+  var job = OpenPressJob();
+  Ui.SignInAs(Ravi);
+  Ui.Visit("/jobs/" + job.Id);
+  Assert.Visible("No such assignment");
+  Assert.Hidden("Press P-200 faults intermittently");
+  Ui.Visit("/");
+  Assert.Visible("No jobs");
+}

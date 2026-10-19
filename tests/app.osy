@@ -1,0 +1,13 @@
+// The producer's test project for Osysharp.Assignments — a workshop that services other people's machines. A customer
+// reports a press that faults now and then; the workshop owns that until the press runs clean, however many visits,
+// parts and second looks it takes. No model is ever called: its one model is scripted.
+app Workshop {
+  model "model/**/*.osy";
+  tests "**/*.test.osy";
+  use Osysharp.Assignments@1;
+  use Osysharp.Llm@2;
+  use Osysharp.Identity@0;
+  use Osysharp.Observability;
+  use Osysharp.Workflow;
+  use Osysharp.Ui;
+}

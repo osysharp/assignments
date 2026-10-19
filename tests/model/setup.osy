@@ -1,0 +1,16 @@
+// The workshop's model and how it uses assignments. In a file of its own with no `namespace`, because an
+// `app.X = …` statement's value is resolved outside the file's namespace.
+using Osysharp.Assignments;
+using Osysharp.Llm;
+
+app.Llm = new LlmSetup {
+  Models = [
+    // $1 a million tokens in and $5 out: a scripted answer of 100 in and 20 out costs 200 millionths of a dollar.
+    new LlmModel { Name = "Small", Client = new ScriptedModel { Name = "Small" }, Model = "scripted-small",
+                   Price = new LlmPrice { Input = 1, Output = 5 }, MaxOutputTokens = 1000 },
+  ],
+  Default = "Small",
+};
+
+// A job that establishes nothing for two days is stalled.
+app.Assignments = new AssignmentsSetup { StalledAfter = TimeSpan.FromDays(2) };

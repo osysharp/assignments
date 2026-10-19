@@ -1,0 +1,305 @@
+// What is attached to an assignment: an agent's run, a process, a question put to a person, work handed to another
+// system, something that was done once and must not be done twice. Each can fail or be replaced; the assignment stays.
+namespace Osysharp.Assignments;
+
+using Osysharp.Identity;
+
+/// What kind of thing a piece of attached work is. ⚠ Appended, never inserted: an enum is stored by position.
+public enum WorkKind {
+  /// An agent's piece of work — its receipt is the subject.
+  [Label("Agent work")] AgentTask,
+  /// A run of a process.
+  [Label("Process")] WorkflowRun,
+  /// Something asked of a person: an answer, a document, a decision, an approval.
+  [Label("Request")] Request,
+  /// Work handed to another system, which answers in its own time.
+  [Label("Handoff")] Handoff,
+  /// Something that was DONE for the assignment and must not be done twice: a refund, a booking, a message sent.
+  [Label("Action")] Action,
+  /// Anything else the assignment waits on or has had done.
+  [Label("Other")] Other,
+}
+
+/// Where a piece of attached work stands. ⚠ Appended, never inserted.
+public enum WorkState {
+  /// It is under way, or waited for.
+  [Label("Open")] Open,
+  /// It finished, and did what it was for.
+  [Label("Done")] Done,
+  /// It ended without doing what it was for.
+  [Label("Failed")] Failed,
+  /// It was called off.
+  [Label("Cancelled")] Cancelled,
+}
+
+/// The number each piece of work attached to one assignment is given as it is attached.
+Counter AssignmentWorkNumber = new() { Start = 0 };
+
+/// ⭐ ONE PIECE OF WORK ATTACHED TO AN ASSIGNMENT — what the assignment is waiting on, or has had done for it.
+///
+/// It names what it is (`Kind`, and the row it stands for: `Subject`), who the next step is with (`WaitingOn`), when
+/// it is wanted by, what it cost and how it ended. It never owns the assignment: finishing every piece of work
+/// completes nothing — the criteria do.
+///
+/// ⚑ `Key` MAKES ATTACHING SAFE TO REPEAT. Work attached twice under one key is one piece of work, so a process that
+///   is run again after a crash finds what it had already attached — and, for an `Action`, what it had already done.
+[Unique(Assignment, Key)]
+public entity AssignmentWork {
+  [Required, Immutable, Index] Assignment Assignment;
+  /// Its number among the assignment's work, from 1, in the order it was attached.
+  [Counter(AssignmentWorkNumber, scope = Assignment)] int Number;
+  [Immutable] WorkKind Kind = WorkKind.Other;
+  /// What it is, as a person reads it in a list — "Ask the customer about a replacement".
+  [Required, MaxLength(300), Classification(Personal.Content)] string Title;
+  /// What it is found by. One piece of work per key on an assignment; a key nobody gave is the row's own id.
+  [Required, Immutable, MaxLength(200)] string Key;
+  /// The row it stands for — an agent's receipt, the record a process runs on, the request — and what kind of row.
+  Guid? Subject;
+  [MaxLength(200)] string SubjectType = "";
+  /// The parallel branch it belongs to, as the app names its branches. "": the assignment as a whole.
+  [Immutable, MaxLength(80)] string Branch = "";
+
+  WorkState State = WorkState.Open;
+  /// Who the next step is with — a person, or an agent's own account. Nobody: a system, or nobody in particular.
+  [Classification(Personal.Identity)] Principal? WaitingOn;
+  /// What is waited for, in words — "the carrier's answer", "a signature".
+  [MaxLength(300), Classification(Personal.Content)] string WaitingFor = "";
+  /// It cannot move: what it needs is not available. `BlockedWhy` says what.
+  bool Blocked = false;
+  [MaxLength(600), Classification(Personal.Content)] string BlockedWhy = "";
+  /// When it is wanted by. Null: no date.
+  DateTime? DueAt;
+
+  [Immutable] DateTime OpenedAt = DateTime.UtcNow;
+  [Classification(Personal.Identity)] Principal? OpenedBy;
+  DateTime LastActivityAt = DateTime.UtcNow;
+  DateTime? LastProgressAt;
+  DateTime? ClosedAt;
+  /// What it has spent on models, in millionths of a US dollar.
+  long CostMicros = 0;
+  /// Its model calls named the assignment's own scope as they were made (`ChargedTo`), so the assignment had
+  /// already been charged — and held to its budget — while the work ran; `CostMicros` is then this work's share of
+  /// that, not something to add to it.
+  bool ChargedAsSpent = false;
+  /// How it ended, or what it produced, in words.
+  [MaxLength(2000), Classification(Personal.Content)] string Result = "";
+
+  security {
+    allow read when IsAuthenticated where AssignmentParticipant.Any(p => p.Assignment.Id == Assignment.Id && p.Person == user);
+    allow read when OverseesAssignments || ErasesAssignments;
+    // Made only inside this package's own functions (the `deny create` below), each of which writes the assignment
+    // itself — so whoever may not change the assignment makes nothing on it.
+    allow create when IsAuthenticated where AssignmentParticipant.Any(p => p.Assignment.Id == Assignment.Id && p.Person == user && p.Acts);
+    allow create when OverseesAssignments;
+    allow update when IsAuthenticated where AssignmentParticipant.Any(p => p.Assignment.Id == Assignment.Id && p.Person == user && p.Acts);
+    allow update when OverseesAssignments || ErasesAssignments;
+    deny create except via AttachWork;
+    deny update State, ClosedAt except via CloseWork;
+    deny update CostMicros, ChargedAsSpent except via CountWorkCost;
+    deny update Subject, SubjectType, DueAt except via UpdateWork;
+    deny update Blocked except via BlockWork, UnblockWork, CloseWork;
+    // What it says, and who it waits on, also change when a person is taken off or the assignment's words are erased.
+    deny update Result except via CloseWork, TakePersonOffAssignment, AnonymiseAssignment;
+    deny update Title, WaitingFor except via UpdateWork, TakePersonOffAssignment, AnonymiseAssignment;
+    deny update WaitingOn except via UpdateWork, TakePersonOffAssignment;
+    deny update OpenedBy except via TakePersonOffAssignment;
+    deny update BlockedWhy except via BlockWork, UnblockWork, CloseWork, TakePersonOffAssignment, AnonymiseAssignment;
+    deny update LastActivityAt, LastProgressAt except via TouchWork;
+    deny delete;
+  }
+}
+
+/// What a piece of work is attached with.
+public class WorkAttachment {
+  public WorkKind Kind = WorkKind.Other;
+  public string Title = "";
+  /// What it is found by: attach again with the same key and the piece of work already there is answered.
+  public string Key = "";
+  public Guid? Subject;
+  public string SubjectType = "";
+  public string Branch = "";
+  public Principal? WaitingOn;
+  public string WaitingFor = "";
+  public DateTime? DueAt;
+}
+
+/// ⭐ ATTACH A PIECE OF WORK to an assignment — or answer the one already attached under the same key.
+///
+///     var ask = AttachWork(a, new WorkAttachment {
+///       Kind = WorkKind.Request, Key = "replacement-ok", Title = "Ask the customer about a replacement",
+///       WaitingOn = customer, WaitingFor = "their answer", DueAt = thursday,
+///     });
+[Server, Authorize(IsAuthenticated)]
+public AssignmentWork AttachWork(Assignment a, WorkAttachment what) {
+  if (what.Key != "") {
+    var there = AssignmentWork.FirstOrDefault(w => w.Assignment == a && w.Key == what.Key);
+    if (there != null) { return there!; }
+  }
+  RequireOpen(a);
+  if (what.Title.Trim() == "") { throw new ValidationException("A piece of work says what it is: its `Title`."); }
+  var id = Guid.NewGuid();
+  var work = new AssignmentWork {
+    Id = id, Assignment = a, Kind = what.Kind, Title = Clip(what.Title.Trim(), 300), Key = what.Key == "" ? id.ToString() : what.Key,
+    Subject = what.Subject, SubjectType = what.SubjectType, Branch = what.Branch,
+    WaitingOn = what.WaitingOn, WaitingFor = Clip(what.WaitingFor, 300), DueAt = what.DueAt, OpenedBy = Me(),
+  };
+  // Something that was done once is said once, when it is recorded as done.
+  if (what.Kind != WorkKind.Action) {
+    RecordActivity(a, new ActivityNote { Kind = ActivityKind.WorkAttached, Said = $"{KindWords(what.Kind)}: {work.Title}", Work = work, Branch = what.Branch, Reference = work.Id, ReferenceType = "AssignmentWork" });
+  }
+  return work;
+}
+
+/// The piece of work attached to `a` under `key`, or null.
+public AssignmentWork? WorkOf(Assignment a, string key) {
+  return AssignmentWork.FirstOrDefault(w => w.Assignment == a && w.Key == key);
+}
+
+/// What changes on a piece of work while it is open. A member left null is left as it is.
+public class WorkUpdate {
+  public string? Title;
+  public Guid? Subject;
+  public string? SubjectType;
+  public Principal? WaitingOn;
+  /// Nobody in particular has the next step any more.
+  public bool NobodyWaitedOn = false;
+  public string? WaitingFor;
+  public DateTime? DueAt;
+  /// Why its date moves — required when `DueAt` is given.
+  public string Why = "";
+}
+
+/// Change what a piece of work stands for, who the next step is with, or when it is wanted by. A date that moves is
+/// recorded with the date it was and why.
+[Server, Authorize(IsAuthenticated)]
+public void UpdateWork(AssignmentWork work, WorkUpdate change) {
+  RequireOpenWork(work);
+  if (change.Title != null) { work.Title = Clip(change.Title!.Trim(), 300); }
+  if (change.Subject != null) { work.Subject = change.Subject; }
+  if (change.SubjectType != null) { work.SubjectType = change.SubjectType!; }
+  if (change.WaitingOn != null) { work.WaitingOn = change.WaitingOn; }
+  if (change.NobodyWaitedOn) { work.WaitingOn = null; }
+  if (change.WaitingFor != null) { work.WaitingFor = Clip(change.WaitingFor!, 300); }
+  if (change.DueAt != null) {
+    if (change.Why.Trim() == "") { throw new ValidationException("Say why the date moves: it is kept with the assignment."); }
+    var was = work.DueAt;
+    work.DueAt = change.DueAt;
+    RecordActivity(work.Assignment, new ActivityNote {
+      Kind = ActivityKind.DeadlineMoved, Work = work, Branch = work.Branch,
+      Said = $"“{work.Title}” is wanted by {WhenWords(change.DueAt)} (it was {WhenWords(was)}): {change.Why.Trim()}",
+    });
+  }
+}
+
+/// A piece of work moved on: something was established on the way. Like `NoteProgress`, it points at what it rests on.
+[Server, Authorize(IsAuthenticated)]
+public void ProgressWork(AssignmentWork work, string what, Guid reference, string referenceType) {
+  RequireOpenWork(work);
+  if (what.Trim() == "") { throw new ValidationException("Say what was established."); }
+  if (reference == Guid.Empty || referenceType.Trim() == "") {
+    throw new ValidationException("Progress points at what it rests on: the id of a piece of evidence, a finished step or an event, and what kind of thing it is.");
+  }
+  RecordActivity(work.Assignment, new ActivityNote {
+    Kind = ActivityKind.WorkProgressed, Progress = true, Work = work, Branch = work.Branch, Said = $"{work.Title}: {what.Trim()}",
+    Reference = reference, ReferenceType = referenceType.Trim(),
+  });
+}
+
+/// Something happened on a piece of work that established nothing — it was reminded, it was tried again.
+[Server, Authorize(IsAuthenticated)]
+public void NoteWorkActivity(AssignmentWork work, ActivityKind kind, string what) {
+  if (kind != ActivityKind.Note && kind != ActivityKind.Reminder && kind != ActivityKind.Retry && kind != ActivityKind.StatusSummary) {
+    throw new ValidationException("`NoteWorkActivity` records a note, a reminder, a retry or a status summary.");
+  }
+  RecordActivity(work.Assignment, new ActivityNote { Kind = kind, Work = work, Branch = work.Branch, Said = $"{work.Title}: {what.Trim()}" });
+}
+
+/// A piece of work cannot move: what it needs is not there. The assignment is blocked until `UnblockWork`.
+[Server, Authorize(IsAuthenticated)]
+public void BlockWork(AssignmentWork work, string why) {
+  RequireOpenWork(work);
+  if (why.Trim() == "") { throw new ValidationException("Say what it is blocked on."); }
+  work.Blocked = true;
+  work.BlockedWhy = Clip(why.Trim(), 600);
+  RecordActivity(work.Assignment, new ActivityNote { Kind = ActivityKind.WorkBlocked, Work = work, Branch = work.Branch, Said = $"“{work.Title}” is blocked: {work.BlockedWhy}" });
+}
+
+/// What a piece of work was blocked on is there again.
+[Server, Authorize(IsAuthenticated)]
+public void UnblockWork(AssignmentWork work, string how = "") {
+  if (!work.Blocked) { return; }
+  work.Blocked = false;
+  work.BlockedWhy = "";
+  RecordActivity(work.Assignment, new ActivityNote { Kind = ActivityKind.WorkUnblocked, Work = work, Branch = work.Branch, Said = $"“{work.Title}” can move again" + (how.Trim() == "" ? "." : ": " + how.Trim()) });
+}
+
+/// ⭐ A PIECE OF WORK ENDED: done, failed or cancelled, with what it produced in words. Work that is done is
+/// progress; work that failed or was cancelled is activity. Closing it completes nothing: the criteria do.
+[Server, Authorize(IsAuthenticated)]
+public void CloseWork(AssignmentWork work, WorkState state, string result = "") {
+  if (work.State != WorkState.Open) { return; }
+  if (state == WorkState.Open) { throw new ValidationException("A piece of work is closed as done, failed or cancelled."); }
+  work.State = state;
+  work.ClosedAt = DateTime.UtcNow;
+  work.Result = Clip(result.Trim(), 2000);
+  work.Blocked = false;
+  work.BlockedWhy = "";
+  var word = state == WorkState.Done ? "done" : state == WorkState.Failed ? "failed" : "cancelled";
+  RecordActivity(work.Assignment, new ActivityNote {
+    Kind = ActivityKind.WorkClosed, Progress = state == WorkState.Done, Work = work, Branch = work.Branch,
+    Reference = work.Subject ?? work.Id, ReferenceType = work.Subject == null ? "AssignmentWork" : work.SubjectType,
+    Said = $"“{work.Title}” is {word}" + (work.Result == "" ? "." : ": " + work.Result),
+  });
+  Raise(new AssignmentWorkClosed { Work = work });
+}
+
+/// Count what a piece of work has spent on models, in millionths of a US dollar — `total` is what it has spent in
+/// all, so counting the same figure twice counts it once. `chargedAsSpent`: the work's calls named the assignment's
+/// own scope as they were made (they carried `ChargedTo(a)`), so the figure is already in what the assignment was
+/// charged and is counted once, as this work's.
+[Server, Authorize(IsAuthenticated)]
+public void CountWorkCost(AssignmentWork work, long total, bool chargedAsSpent = false) {
+  if (total < 0) { throw new ValidationException("A cost is not negative."); }
+  if (total == work.CostMicros && chargedAsSpent == work.ChargedAsSpent) { return; }
+  work.CostMicros = total;
+  work.ChargedAsSpent = chargedAsSpent;
+}
+
+/// The two clocks of a piece of work, moved with the assignment's.
+[Server, Authorize(IsAuthenticated)]
+internal void TouchWork(AssignmentWork work, DateTime at, bool progress) {
+  work.LastActivityAt = at;
+  if (progress) { work.LastProgressAt = at; }
+}
+
+// ── done once ───────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// ⭐ WHAT WAS ALREADY DONE for an assignment under `key`, or null when it has not been — ask before doing something
+/// that must not happen twice, and record it in the same unit of work as the doing:
+///
+///     var done = DoneFor(a, "refund:" + order.Id);
+///     if (done != null) { return done.Result; }            // a run that is repeated finds it, and does not refund again
+///     order.Refunded = true;
+///     RecordDone(a, "refund:" + order.Id, "Refund order " + order.Number, "Refunded 42.00 EUR");
+public AssignmentWork? DoneFor(Assignment a, string key) {
+  var work = WorkOf(a, key);
+  return work != null && work!.Kind == WorkKind.Action && work!.State == WorkState.Done ? work : null;
+}
+
+/// Record that something was done for an assignment, once, under `key` — the other half of `DoneFor`.
+[Server, Authorize(IsAuthenticated)]
+public AssignmentWork RecordDone(Assignment a, string key, string title, string result, Guid? subject = null, string subjectType = "") {
+  if (key.Trim() == "") { throw new ValidationException("What is done once is found by its key."); }
+  var work = AttachWork(a, new WorkAttachment { Kind = WorkKind.Action, Key = key, Title = title, Subject = subject, SubjectType = subjectType });
+  CloseWork(work, WorkState.Done, result);
+  return work;
+}
+
+void RequireOpenWork(AssignmentWork work) {
+  if (work.State != WorkState.Open) { throw new AssignmentRefused($"“{work.Title}” is closed."); }
+}
+
+string KindWords(WorkKind kind) {
+  return kind == WorkKind.AgentTask ? "Agent work" : kind == WorkKind.WorkflowRun ? "Process" : kind == WorkKind.Request ? "Request"
+       : kind == WorkKind.Handoff ? "Handed off" : kind == WorkKind.Action ? "Done" : "Attached";
+}

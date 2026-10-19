@@ -1,0 +1,195 @@
+// Osysharp.Assignments — what is attached to an assignment, what was done for it once, and what it has cost.
+//
+// The numbers. The workshop's model costs $1 a million tokens in and $5 out, so a scripted answer of 100 in and 20 out
+// costs 200 millionths of a dollar.
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Assignments;
+using Workshop;
+
+[Test(Floor)]
+void work_attached_twice_under_one_key_is_one_piece_of_work() {
+  var job = OpenPressJob();
+  runas (Tariq) {
+    var a = Job(job);
+    var first = AttachWork(a, new WorkAttachment { Kind = WorkKind.Handoff, Key = "parts", Title = "Ask the supplier for a valve", WaitingFor = "the supplier's answer" });
+    UnitOfWork.Commit();
+    // A process that is run again after a crash attaches what it had already attached.
+    var again = AttachWork(Job(job), new WorkAttachment { Kind = WorkKind.Handoff, Key = "parts", Title = "Ask the supplier for a valve — again" });
+    Assert.Equal(first.Id, again.Id);
+    Assert.Equal(1, Job(job).Work.Count());
+    Assert.Equal("Ask the supplier for a valve", again.Title);
+    Assert.Equal(1, Job(job).Activity.Count(l => l.Kind == ActivityKind.WorkAttached));
+    // Work attached with no key is its own piece of work every time.
+    AttachWork(Job(job), new WorkAttachment { Title = "A phone call" });
+    AttachWork(Job(job), new WorkAttachment { Title = "A phone call" });
+    Assert.Equal(3, Job(job).Work.Count());
+  }
+}
+
+[Test(Floor)]
+void what_was_done_once_for_an_assignment_is_found_and_not_done_again() {
+  var job = OpenPressJob();
+  runas (Tariq) {
+    var a = Job(job);
+    Assert.Null(DoneFor(a, "part-order"));
+    RecordDone(a, "part-order", "Order the replacement valve", "Ordered from the supplier, reference 7731");
+    UnitOfWork.Commit();
+
+    var done = DoneFor(Job(job), "part-order");
+    Assert.NotNull(done);
+    Assert.Equal("Ordered from the supplier, reference 7731", done!.Result);
+    Assert.Equal(WorkKind.Action, done!.Kind);
+    // Recording it again changes nothing: it was done once.
+    var again = RecordDone(Job(job), "part-order", "Order the replacement valve", "Ordered a second time");
+    Assert.Equal(done!.Id, again.Id);
+    Assert.Equal("Ordered from the supplier, reference 7731", DoneFor(Job(job), "part-order")!.Result);
+    Assert.Equal(1, Job(job).Work.Count());
+  }
+}
+
+[Test(Floor)]
+void finishing_every_piece_of_work_completes_nothing() {
+  var job = OpenPressJob();
+  runas (Tariq) {
+    var a = Job(job);
+    CloseWork(AttachWork(a, new WorkAttachment { Key = "visit-1", Title = "First visit" }), WorkState.Done, "Valve replaced.");
+    CloseWork(AttachWork(a, new WorkAttachment { Key = "visit-2", Title = "Second visit" }), WorkState.Failed, "Nobody on site.");
+    Assert.True(Job(job).Work.All(w => w.State != WorkState.Open));
+    Assert.Equal(AssignmentState.Open, Job(job).State);
+    Assert.False(CompletionOf(Job(job)).Ready);
+    // Work that is done is progress; work that failed is activity.
+    var lines = Job(job).Activity.Where(l => l.Kind == ActivityKind.WorkClosed).OrderBy(l => l.Seq).ToList();
+    Assert.True(lines[0].Progress);
+    Assert.False(lines[1].Progress);
+    // A closed piece of work is not closed twice, nor moved.
+    CloseWork(WorkOf(Job(job), "visit-1")!, WorkState.Failed, "Changed my mind.");
+    Assert.Equal(WorkState.Done, WorkOf(Job(job), "visit-1")!.State);
+    Assert.Throws<AssignmentRefused>(() => BlockWork(WorkOf(Job(job), "visit-1")!, "Too late."));
+  }
+}
+
+[Test(Floor)]
+void a_piece_of_works_date_moves_only_with_a_reason_and_the_move_is_kept() {
+  TestClock.Set(new DateTime(2026, 5, 4, 9, 0, 0));
+  var job = OpenPressJob();
+  runas (Tariq) {
+    var a = Job(job);
+    var wait = AttachWork(a, new WorkAttachment { Kind = WorkKind.Handoff, Key = "parts", Title = "Ask the supplier for a valve", DueAt = new DateTime(2026, 5, 6, 9, 0, 0) });
+    Assert.Throws<ValidationException>(() => UpdateWork(wait, new WorkUpdate { DueAt = new DateTime(2026, 5, 13, 9, 0, 0) }));
+    UpdateWork(wait, new WorkUpdate { DueAt = new DateTime(2026, 5, 13, 9, 0, 0), Why = "The supplier is closed for a week.", WaitingOn = Ravi });
+
+    var moved = WorkOf(Job(job), "parts")!;
+    Assert.Equal(new DateTime(2026, 5, 13, 9, 0, 0), moved.DueAt);
+    Assert.Equal(Ravi.Id, moved.WaitingOn!.Id);
+    Assert.Equal("“Ask the supplier for a valve” is wanted by 13 May 2026 09:00 UTC (it was 6 May 2026 09:00 UTC): The supplier is closed for a week.", ActivityOf(Job(job))[0].Said);
+    Assert.Equal(["Ravi Nair"], ConditionsOf(Job(job)).NextStepWith);
+  }
+}
+
+// ── cost ────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Floor)]
+void a_model_call_charged_to_an_assignment_is_counted_on_it() {
+  var job = OpenPressJob();
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("Waiting on the supplier.", 300, 40));
+  runas (Tariq) {
+    Assert.Equal(0, CostOf(Job(job)).TotalMicros);
+    Assert.Equal("Waiting on the supplier.", Summarise(Job(job)));
+    Summarise(Job(job));
+
+    // 300 + 5×40 millionths of a dollar a call, twice.
+    var cost = CostOf(Job(job));
+    Assert.Equal(1000, cost.OwnMicros);
+    Assert.Equal(1000, cost.TotalMicros);
+    Assert.Equal(0.001m, cost.Total);
+    Assert.Null(cost.LeftMicros);
+    Assert.False(cost.Spent);
+  }
+  // The meter has each call under the assignment's scope — what the manager reads.
+  runas (Mona) {
+    Assert.Equal(0.001m, SpentOn(AssignmentScope(Job(job))));
+    Assert.Equal(2, ModelCall.Count(c => c.Purpose == "status summary"));
+  }
+}
+
+[Test(Floor)]
+void a_call_that_does_not_fit_the_assignments_budget_is_refused_before_anything_is_sent() {
+  var job = OpenPressJob();
+  List<string> asked = [];
+  // Each answer costs 1000 + 5×200 = 2000 millionths; room for about 5000 is reserved before a call leaves.
+  ScriptedAnswer.Stub((model, request) => { asked.Add(model); return Scripted.Text("A summary.", 1000, 200); });
+  runas (Dana) { SetAssignmentBudget(Job(job), 0.01m); }       // a cent for the whole job
+  runas (Tariq) {
+    Summarise(Job(job));
+    Summarise(Job(job));
+    Summarise(Job(job));
+    Assert.Equal(6000, CostOf(Job(job)).OwnMicros);
+    Assert.Equal(4000, CostOf(Job(job)).LeftMicros);
+
+    // What is left does not cover what a fourth call could cost: it is refused, and the model is never asked.
+    var refused = Assert.Throws<LlmRefused>(() => Summarise(Job(job)));
+    Assert.Contains("Nothing was sent", refused.Message);
+    Assert.Equal(3, asked.Count);
+    Assert.Equal(6000, CostOf(Job(job)).OwnMicros);
+  }
+  // Lifted, the job is counted and not limited.
+  runas (Dana) { SetAssignmentBudget(Job(job), null); }
+  runas (Tariq) {
+    Summarise(Job(job));
+    Assert.Equal(8000, CostOf(Job(job)).OwnMicros);
+    Assert.Null(CostOf(Job(job)).LeftMicros);
+  }
+}
+
+[Test(Floor)]
+void what_attached_work_spent_is_counted_once_however_often_it_reports() {
+  var job = OpenPressJob();
+  runas (Dana) { SetAssignmentBudget(Job(job), 0.01m); }
+  runas (Tariq) {
+    var a = Job(job);
+    var run = AttachWork(a, new WorkAttachment { Kind = WorkKind.AgentTask, Key = "diagnose", Title = "Read the pressure logs" });
+    // It reports what it has spent IN ALL as it goes: 2,000, then 4,500 — and the last figure a second time.
+    CountWorkCost(run, 2000);
+    CountWorkCost(WorkOf(Job(job), "diagnose")!, 4500);
+    CountWorkCost(WorkOf(Job(job), "diagnose")!, 4500);
+    var other = AttachWork(Job(job), new WorkAttachment { Kind = WorkKind.AgentTask, Key = "second-opinion", Title = "A second look" });
+    CountWorkCost(other, 5500);
+
+    var cost = CostOf(Job(job));
+    Assert.Equal(10000, cost.WorkMicros);
+    Assert.Equal(10000, cost.TotalMicros);
+    Assert.Equal(0, cost.LeftMicros);
+    Assert.True(cost.Spent);
+    // With its budget spent, nothing more is started on its account — and its own calls have no room either.
+    var refused = Assert.Throws<AssignmentBudgetSpent>(() => RequireRoomIn(Job(job)));
+    Assert.Equal("“Press P-200 faults intermittently” has spent its budget ($0.01 of $0.01). Nothing more is started on its account.", refused.Message);
+    Assert.Throws<LlmRefused>(() => Summarise(Job(job)));
+    Assert.Throws<ValidationException>(() => CountWorkCost(WorkOf(Job(job), "diagnose")!, -1));
+  }
+}
+
+[Test(Floor)]
+void an_assignment_counts_what_was_spent_under_it() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("A summary.", 300, 40));
+  Assignment? top = null;
+  Assignment? below = null;
+  runas (Mona) {
+    top = OpenAssignment(new NewAssignment { Title = "Recall", Goal = "Every press has the new valve.", Criteria = ["All fitted"] });
+    below = OpenAssignment(new NewAssignment { Title = "New valve on P-200", Goal = "P-200 has it.", Criteria = ["Fitted"], Parent = top! });
+    Summarise(top!);
+    Summarise(below!);
+    var run = AttachWork(below!, new WorkAttachment { Kind = WorkKind.AgentTask, Key = "fit", Title = "Plan the fitting" });
+    CountWorkCost(run, 2500);
+
+    var under = CostOf(Job(below!));
+    Assert.Equal(500, under.OwnMicros);
+    Assert.Equal(2500, under.WorkMicros);
+    Assert.Equal(3000, under.TotalMicros);
+    var all = CostOf(Job(top!));
+    Assert.Equal(500, all.OwnMicros);
+    Assert.Equal(0, all.WorkMicros);
+    Assert.Equal(3000, all.ChildrenMicros);
+    Assert.Equal(3500, all.TotalMicros);
+  }
+}

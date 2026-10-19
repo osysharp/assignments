@@ -1,0 +1,198 @@
+// Osysharp.Assignments — erasing: a person can be taken off the assignments they worked on, and what an assignment
+// says can be scrubbed of whoever it was about, while what was asked for, where each criterion stood and how it
+// ended stay.
+using Osysharp.Identity;
+using Osysharp.Assignments;
+using Workshop;
+
+/// The press's job with Tariq's work on it: a visit, the first criterion met, and a note that names him.
+Assignment PressJobWithTariqsWork() {
+  var job = OpenPressJob();
+  runas (Tariq) {
+    var a = Job(job);
+    AttachWork(a, new WorkAttachment { Kind = WorkKind.Other, Key = "visit-1", Title = "First visit by Tariq Aziz" });
+    MeetCriterion(Criterion(a, 1), "A worn pilot valve");
+    NoteActivity(a, ActivityKind.Note, "Tariq Aziz rang the customer; reach him at tariq@workshop.example.");
+  }
+  return job;
+}
+
+[Test(Floor)]
+void a_person_taken_off_an_assignment_leaves_it_whole_and_reads_as_somebody_no_longer_here() {
+  var job = PressJobWithTariqsWork();
+  var tariq = Tariq.Id;
+  var lines = 0;
+  runas (Mona) { lines = Job(job).Activity.Count(); }
+
+  runas (Rosa) { TakePersonOffAssignment(Job(job), Tariq, "a former technician", "He left the workshop and asked to be erased."); }
+
+  runas (Mona) {
+    var a = Job(job);
+    // He is no longer on it, and nothing on it is his.
+    Assert.Equal(1, a.Participants.Count());
+    Assert.Equal(0, AssignmentActivity.Count(l => l.By != null && l.By.Id == tariq));
+    Assert.Equal(0, AssignmentCriterion.Count(c => c.SettledBy != null && c.SettledBy.Id == tariq));
+    Assert.Equal(0, AssignmentWork.Count(w => w.OpenedBy != null && w.OpenedBy.Id == tariq));
+    // His name and his address are out of every sentence, with words in their place — not a hole.
+    var says = EverythingItSays(a);
+    Assert.DoesNotContain("Tariq", says);
+    Assert.DoesNotContain("tariq@workshop.example", says);
+    Assert.Contains("a former technician rang the customer; reach him at a former technician.", says);
+    Assert.Contains("First visit by a former technician", says);
+    // The assignment is whole: what was asked for, each criterion and where it stands, the work, every line.
+    Assert.Equal("Press P-200 faults intermittently", a.Title);
+    Assert.Equal(AssignmentState.Open, a.State);
+    Assert.Equal(CriterionState.Met, Criterion(a, 1).State);
+    Assert.Equal("A worn pilot valve", Criterion(a, 1).MetBy);
+    Assert.True(Criterion(a, 1).SettledByFormer);
+    Assert.Equal(1, a.Work.Count());
+    Assert.Equal(lines, a.Activity.Count());
+    // A page says who did what as "Somebody no longer here" — never as the app, and never as nobody.
+    var sheet = SheetOf(a.Id);
+    Assert.StartsWith("Somebody no longer here, ", sheet.Criteria.First().Settled);
+    Assert.True(ActivityOf(a).Any(l => l.By == "Somebody no longer here"));
+    Assert.False(ActivityOf(a).Any(l => l.By == "Tariq Aziz"));
+    // Dana, who asked, is untouched.
+    Assert.Equal("Dana Holm", sheet.Requester);
+  }
+  // He reads nothing of it any more; Dana reads it as before.
+  runas (Tariq) { Assert.Equal(0, Assignment.Count()); Assert.Equal(0, AssignmentActivity.Count()); }
+  runas (Dana) { Assert.Equal(1, Assignment.Count()); }
+}
+
+[Test(Floor)]
+void whoever_asked_can_be_taken_off_and_the_assignment_is_left_to_whoever_oversees() {
+  var job = PressJobWithTariqsWork();
+  runas (Rosa) { TakePersonOffAssignment(Job(job), Dana, "a former colleague", "She left and asked to be erased."); }
+  runas (Mona) {
+    var a = Job(job);
+    Assert.Null(a.Requester);
+    Assert.Equal("Somebody no longer here", SheetOf(a.Id).Requester);
+    // It is still worked on, and still closed by what done means.
+    MeetCriterion(Criterion(a, 2), "The customer approved 4,200");
+    MeetCriterion(Criterion(a, 3), "It ran a shift clean");
+    CompleteAssignment(a, "Repaired.");
+    Assert.Equal(AssignmentState.Completed, Job(job).State);
+  }
+  // Tariq, the assignee, still reads and works on it as before.
+  runas (Tariq) { Assert.Equal(1, Assignment.Count()); }
+  runas (Dana) { Assert.Equal(0, Assignment.Count()); }
+}
+
+/// A job about a customer by name, called off.
+Assignment CarlsJob() {
+  Assignment? job = null;
+  runas (Dana) {
+    job = OpenAssignment(new NewAssignment {
+      Title = "Carl Lind's press faults", Goal = "Carl Lind's press runs a full shift without faulting.",
+      Scope = "Reach him at carl@pressworks.example.", Criteria = ["Carl Lind approved the cost"], Assignees = [Tariq],
+    });
+  }
+  runas (Tariq) {
+    var a = JobBy(job!.Id);
+    AttachWork(a, new WorkAttachment { Kind = WorkKind.Request, Key = "approval", Title = "Ask Carl about the cost", WaitingFor = "Carl's answer" });
+    NoteActivity(a, ActivityKind.Note, "CARL LIND said he is selling the press.");
+  }
+  runas (Dana) { CancelAssignment(JobBy(job!.Id), "Carl sold the press."); }
+  return job!;
+}
+
+[Test(Floor)]
+void what_an_assignment_says_is_scrubbed_of_the_words_that_say_who_it_is_about() {
+  var job = CarlsJob();
+  var lines = 0;
+  runas (Mona) { lines = Job(job).Activity.Count(); Assert.Contains("Carl", EverythingItSays(Job(job))); }
+
+  runas (Rosa) {
+    AnonymiseAssignment(Job(job), new AssignmentScrub {
+      Words = ["Carl Lind", "Carl", "carl@pressworks.example"], StandIn = "a former customer", Why = "He asked to be erased." });
+  }
+
+  runas (Mona) {
+    var a = Job(job);
+    var says = EverythingItSays(a);
+    // Not his name — in any capitals — nor his address, anywhere; and words where they stood.
+    Assert.DoesNotContain("Carl", says);
+    Assert.DoesNotContain("CARL", says);
+    Assert.DoesNotContain("pressworks", says);
+    Assert.Equal("a former customer's press faults", a.Title);
+    Assert.Equal("a former customer's press runs a full shift without faulting.", a.Goal);
+    Assert.Contains("a former customer said he is selling the press.", says);
+    Assert.Contains("Ask a former customer about the cost", says);
+    // What happened is all there: how it ended, the criterion and where it stood, the work, every line and its kind.
+    Assert.Equal(AssignmentState.Cancelled, a.State);
+    Assert.Equal(CriterionState.Unmet, a.Criteria.Single().State);
+    Assert.Equal(1, a.Work.Count());
+    Assert.Equal(lines, a.Activity.Count());
+    Assert.True(a.Activity.Any(l => l.Kind == ActivityKind.Cancelled));
+    Assert.NotNull(a.AnonymisedAt);
+    Assert.Equal("He asked to be erased.", a.ErasedWhy);
+    // The people who did the work are still named.
+    Assert.Equal("Dana Holm", SheetOf(a.Id).Requester);
+  }
+}
+
+[Test(Floor)]
+void every_sentence_can_be_erased_whole_and_what_happened_still_stands() {
+  var job = CarlsJob();
+  var lines = 0;
+  runas (Mona) { lines = Job(job).Activity.Count(); }
+  runas (Rosa) {
+    AnonymiseAssignment(Job(job), new AssignmentScrub { Blank = true, StandIn = "a former customer", Why = "Its time is up." });
+  }
+  runas (Mona) {
+    var a = Job(job);
+    var says = EverythingItSays(a);
+    Assert.DoesNotContain("Carl", says);
+    Assert.DoesNotContain("press", says);
+    Assert.Equal("An assignment about a former customer", a.Title);
+    Assert.Equal("Erased.", a.Goal);
+    Assert.Equal("An erased criterion", a.Criteria.Single().Text);
+    Assert.Equal(lines, a.Activity.Count(l => l.Said == "Erased."));
+    // That it was asked for, by whom, when, what kind of thing happened on it and how it ended is all still there.
+    Assert.Equal(AssignmentState.Cancelled, a.State);
+    Assert.NotNull(a.ClosedAt);
+    Assert.True(a.Activity.Any(l => l.Kind == ActivityKind.WorkAttached));
+    Assert.True(a.Activity.Any(l => l.Kind == ActivityKind.Cancelled));
+    Assert.Equal(Dana.Id, a.Requester!.Id);
+  }
+}
+
+[Test(Floor)]
+void an_open_assignment_is_not_erased() {
+  var job = PressJobWithTariqsWork();
+  runas (Rosa) {
+    var refused = Assert.Throws<AssignmentRefused>(() => AnonymiseAssignment(Job(job), new AssignmentScrub { Blank = true, Why = "Too early." }));
+    Assert.Contains("is open", refused.Message);
+    Assert.Throws<ValidationException>(() => TakePersonOffAssignment(Job(job), Tariq, "a former technician", " "));
+  }
+  runas (Mona) { Assert.Equal("Press P-200 faults intermittently", Job(job).Title); }
+}
+
+[Test(Floor)]
+void only_whoever_the_app_names_erases_and_only_through_the_kit() {
+  var job = CarlsJob();
+  // Whoever asked, whoever does the work and whoever oversees every assignment do not erase one.
+  runas (Dana)  { Assert.Denied(() => AnonymiseAssignment(Job(job), new AssignmentScrub { Blank = true, Why = "Tidying up." })); }
+  runas (Tariq) { Assert.Denied(() => TakePersonOffAssignment(Job(job), Dana, "somebody", "I would rather she were not on it.")); }
+  runas (Mona)  { Assert.Denied(() => AnonymiseAssignment(Job(job), new AssignmentScrub { Blank = true, Why = "Tidying up." })); }
+  runas (Rosa) {
+    // The records clerk may — through the kit's functions, and no other way.
+    var line = Job(job).Activity.OrderBy(l => l.Seq).First();
+    Assert.Denied(() => { RewriteActivity(line); UnitOfWork.Commit(); });
+    UnitOfWork.Discard();
+    Assert.Denied(() => { DisownActivity(line); UnitOfWork.Commit(); });
+    UnitOfWork.Discard();
+    Assert.Denied(() => { UnseatByHand(AssignmentParticipant.First(p => p.Assignment.Id == job.Id)); UnitOfWork.Commit(); });
+    UnitOfWork.Discard();
+  }
+  // Nothing went: every refusal above left it as it was written.
+  runas (Mona) {
+    Assert.Equal("Carl Lind's press faults", Job(job).Title);
+    Assert.Equal(2, Job(job).Participants.Count());
+    Assert.Null(Job(job).AnonymisedAt);
+  }
+  // Positive control: the same clerk, through the kit.
+  runas (Rosa) { AnonymiseAssignment(Job(job), new AssignmentScrub { Blank = true, Why = "Its time is up." }); }
+  runas (Mona) { Assert.Equal("An assignment about somebody no longer here", Job(job).Title); }
+}

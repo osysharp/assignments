@@ -1,0 +1,38 @@
+// What the app says: who may ask for work, who oversees it, who may close it short of its criteria — and how long an
+// assignment may go without progress before it is stalled.
+namespace Osysharp.Assignments;
+
+/// Who may ask for work — open an assignment. Nobody, until the app says: `policy OpensAssignments => IsStaff;`.
+virtual policy OpensAssignments => false;
+
+/// Who reads and acts on EVERY assignment, whoever asked for it: a coordinator, a team lead. Nobody, until the app
+/// says: `policy OverseesAssignments => IsLead;`.
+virtual policy OverseesAssignments => false;
+
+/// Who may close an assignment with a criterion unmet, by accepting a written exception for it. Nobody, until the app
+/// says: `policy AcceptsAssignmentExceptions => IsManager;`.
+virtual policy AcceptsAssignmentExceptions => false;
+
+/// How this app uses assignments — `app.Assignments = new AssignmentsSetup { StalledAfter = TimeSpan.FromDays(2) };`.
+[AppSetting("Assignments")]
+public class AssignmentsSetup {
+  /// How long an open assignment may go without meaningful progress before it is stalled, when it does not say itself.
+  public TimeSpan StalledAfter = TimeSpan.FromDays(3);
+  /// How deep assignments may be nested under one another.
+  public int MaxDepth = 6;
+}
+
+// ── refusals ────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Something an assignment was asked to do and did not — with the reason, in words a person can act on.
+/// A `ValidationException`, so the reason reaches whoever asked — a model whose tool ran into it included.
+public class AssignmentRefused : ValidationException { }
+
+/// It cannot be completed yet: `Message` names each criterion that is neither met nor excepted.
+public class CriteriaUnmet : AssignmentRefused { }
+
+/// It is closed — completed, cancelled or failed — and only `ReopenAssignment` changes it.
+public class AssignmentClosed : AssignmentRefused { }
+
+/// Its budget is spent: nothing more is started on its account.
+public class AssignmentBudgetSpent : AssignmentRefused { }

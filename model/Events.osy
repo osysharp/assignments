@@ -1,0 +1,72 @@
+// What happens to an assignment, told as events. Hear one with `[On]`: `[On] void TellTheOwner(AssignmentReopened e) { … }`.
+namespace Osysharp.Assignments;
+
+/// Somebody asked for a piece of work.
+[Event("Assignment opened")]
+public sealed class AssignmentOpened {
+  public Assignment Assignment;
+  public override string Sentence() { return $"“{Assignment.Title}” was opened."; }
+}
+
+/// An assignment reached its outcome: every criterion met — or, `ByException`, the rest excepted in writing.
+[Event("Assignment completed")]
+public sealed class AssignmentCompleted {
+  public Assignment Assignment;
+  public bool ByException = false;
+  public override string Sentence() { return $"“{Assignment.Title}” was completed" + (ByException ? " by exception." : "."); }
+}
+
+/// An assignment was called off. Whatever runs work for it stops that work.
+[Event("Assignment called off")]
+public sealed class AssignmentCancelled {
+  public Assignment Assignment;
+  public string Why = "";
+  public override string Sentence() { return $"“{Assignment.Title}” was called off: {Why}"; }
+}
+
+/// An assignment could not be done.
+[Event("Assignment failed")]
+public sealed class AssignmentFailed {
+  public Assignment Assignment;
+  public string Why = "";
+  public override string Sentence() { return $"“{Assignment.Title}” failed: {Why}"; }
+}
+
+/// A closed assignment was opened again: its outcome did not hold.
+[Event("Assignment opened again")]
+public sealed class AssignmentReopened {
+  public Assignment Assignment;
+  public string Why = "";
+  public override string Sentence() { return $"“{Assignment.Title}” was opened again: {Why}"; }
+}
+
+/// One of an assignment's criteria was met.
+[Event("Criterion met")]
+public sealed class AssignmentCriterionMet {
+  public AssignmentCriterion Criterion;
+  public override string Sentence() { return $"Met: “{Criterion.Text}” — {Criterion.MetBy}"; }
+}
+
+/// A criterion that had been settled is back in question.
+[Event("Criterion back in question")]
+public sealed class AssignmentCriterionReopened {
+  public AssignmentCriterion Criterion;
+  public string Why = "";
+  public override string Sentence() { return $"Back in question: “{Criterion.Text}” — {Why}"; }
+}
+
+/// Somebody accepted, in writing, that a criterion will not be met.
+[Event("Exception accepted")]
+public sealed class AssignmentExceptionAccepted {
+  public AssignmentCriterion Criterion;
+  public string Why = "";
+  public override string Sentence() { return $"Exception accepted for “{Criterion.Text}”: {Why}"; }
+}
+
+/// A piece of work attached to an assignment ended: done, failed or cancelled. Closing it completed nothing — the
+/// criteria do — but whoever keeps something in step with attached work hears it here.
+[Event("Attached work ended")]
+public sealed class AssignmentWorkClosed {
+  public AssignmentWork Work;
+  public override string Sentence() { return $"“{Work.Title}” ended."; }
+}

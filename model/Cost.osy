@@ -1,0 +1,90 @@
+// What an assignment has cost. The assignment is a scope model calls are charged to and a limit they are held to;
+// the work attached to it reports what it spent; the assignments opened under it add theirs.
+namespace Osysharp.Assignments;
+
+using Osysharp.Llm;
+
+/// What an assignment has spent on models, in millionths of a US dollar, and the most it may.
+public class AssignmentCost {
+  /// Model calls made for the assignment itself (`ChargedTo`).
+  public long OwnMicros = 0;
+  /// What the work attached to it has spent — agents' runs, most of all.
+  public long WorkMicros = 0;
+  /// What the assignments opened under it have spent, all the way down.
+  public long ChildrenMicros = 0;
+  /// Its budget. 0: it is counted, and not limited.
+  public long BudgetMicros = 0;
+
+  public long TotalMicros => OwnMicros + WorkMicros + ChildrenMicros;
+  /// The same in US dollars.
+  public decimal Total => TotalMicros / 1000000m;
+  public decimal Budget => BudgetMicros / 1000000m;
+  /// What is left of its budget, in millionths of a dollar. Null: it has none.
+  public long? LeftMicros => BudgetMicros == 0 ? null : Math.Max(0, BudgetMicros - TotalMicros);
+  public bool Spent => BudgetMicros > 0 && TotalMicros >= BudgetMicros;
+}
+
+/// The scope an assignment's model calls are charged to — `assignment:8f1c…`. A budget set on it (`SetBudget`
+/// with the scope `assignment`) counts every call that names it.
+public string AssignmentScope(Assignment a) { return "assignment:" + a.Id.ToString(); }
+
+/// ⭐ A MODEL CALL CHARGED TO AN ASSIGNMENT, and held to what is left of its budget: room is reserved before the
+/// call leaves, and a call that does not fit is refused with nothing sent.
+///
+///     var summary = await Llm.Complete(prompt, ChargedTo(a, "status summary"));
+public LlmCall ChargedTo(Assignment a, string purpose = "") {
+  var cost = CostOf(a);
+  var scope = AssignmentScope(a);
+  // What its own calls may still spend: the budget, less what its work and the assignments under it have used.
+  // (Work that was charged here as it spent is already in what this scope has counted, so it is not taken off twice.)
+  var room = a.BudgetMicros == 0 ? Uncapped() : Math.Max(0, a.BudgetMicros - (cost.WorkMicros - ChargedWorkOf(a)) - cost.ChildrenMicros);
+  return new LlmCall {
+    Scopes = [scope], Purpose = purpose,
+    Limits = [new LlmLimit { Scope = scope, Window = LlmBudgetWindow.Total, LimitMicros = room }],
+  };
+}
+
+/// Model calls made for an assignment itself.
+public class Assignments {
+  /// A model's answer to one prompt, charged to the assignment and held to its budget — the plain call for a
+  /// summary, a draft, a classification. It answers a task, as any model call does.
+  ///
+  ///     var summary = await Assignments.Complete(a, "Summarise where this stands: " + notes, "status summary");
+  public static async Task<string> Complete(Assignment a, string prompt, string purpose = "") {
+    var result = await Llm.Complete(prompt, ChargedTo(a, purpose));
+    return result.Text();
+  }
+}
+
+/// ⭐ WHAT AN ASSIGNMENT HAS COST: its own calls, the work attached to it, and the assignments opened under it.
+public AssignmentCost CostOf(Assignment a) {
+  var cost = new AssignmentCost { BudgetMicros = a.BudgetMicros };
+  // Summed from each piece of work's own figure — nothing is kept on the assignment for two pieces of work that
+  // report at the same moment to write over.
+  cost.WorkMicros = AssignmentWork.Where(w => w.Assignment == a).Sum(w => w.CostMicros);
+  // Summed where it is stored, so a call settled a moment ago in a unit of work of its own is already counted.
+  var scope = AssignmentScope(a);
+  var charged = LlmAllowance.Where(x => x.Scope == scope && x.Window == LlmBudgetWindow.Total).Sum(x => x.SpentMicros);
+  // Work whose calls named this scope as they were made is in that figure already: its share is the work's, the
+  // rest is the assignment's own — which, while such work is still running, includes what it has spent so far.
+  cost.OwnMicros = Math.Max(0, charged - ChargedWorkOf(a));
+  foreach (var child in a.Children.ToList()) { cost.ChildrenMicros = cost.ChildrenMicros + CostOf(child).TotalMicros; }
+  return cost;
+}
+
+/// What the work attached to `a` has reported of the spend that was charged to `a` as it happened.
+long ChargedWorkOf(Assignment a) {
+  return AssignmentWork.Where(w => w.Assignment == a && w.ChargedAsSpent).Sum(w => w.CostMicros);
+}
+
+/// Refuse (`AssignmentBudgetSpent`) when the assignment's budget is used up — what starts work on its account asks
+/// first.
+public void RequireRoomIn(Assignment a) {
+  var cost = CostOf(a);
+  if (cost.Spent) {
+    throw new AssignmentBudgetSpent($"“{a.Title}” has spent its budget (${Dollars(cost.TotalMicros)} of ${Dollars(cost.BudgetMicros)}). Nothing more is started on its account.");
+  }
+}
+
+/// An assignment with no budget is counted and not limited: its calls carry a limit nothing reaches.
+long Uncapped() { return 1000000000000000; }

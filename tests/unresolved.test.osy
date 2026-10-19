@@ -1,0 +1,77 @@
+// Osysharp.Assignments — unfinished work stays owned and visible: a missed date waives nothing, every unresolved
+// thing can be listed, and somebody who is not signed in does nothing.
+using Osysharp.Identity;
+using Osysharp.Assignments;
+using Workshop;
+
+[Test(Floor)]
+void a_breach_never_waives_an_approval() {
+  TestClock.Set(new DateTime(2026, 5, 4, 9, 0, 0));
+  var job = OpenPressJob();
+  runas (Dana) { AskForApproval(Job(job), Carl, 480m, new DateTime(2026, 5, 5, 9, 0, 0)); }
+  runas (Tariq) {
+    MeetCriterion(Criterion(Job(job), 1), "A worn pilot valve");
+    MeetCriterion(Criterion(Job(job), 3), "Eight hours with no fault");
+  }
+  // The customer's answer is a month overdue. Everything else is done.
+  TestClock.Advance(TimeSpan.FromDays(30));
+  runas (Tariq) {
+    var a = Job(job);
+    Assert.True(ConditionsOf(a).Overdue);
+    // Being late has approved nothing: the criterion is unmet, and the job cannot be completed.
+    Assert.Equal(CriterionState.Unmet, Criterion(a, 2).State);
+    var refused = Assert.Throws<CriteriaUnmet>(() => CompleteAssignment(a, "The customer never answered; fitted anyway."));
+    Assert.Contains("“The customer approved the cost”", refused.Message);
+    // Nor does it give the technician the right to wave it through.
+    Assert.Denied(() => AcceptException(Criterion(a, 2), "They have had a month."));
+  }
+  // Only somebody the workshop trusts with exceptions can close it without the approval — in writing.
+  runas (Mona) { AcceptException(Criterion(Job(job), 2), "Written off: the customer is unreachable and the press is ours to return."); }
+  runas (Tariq) {
+    CompleteAssignment(Job(job), "Repaired; closed without the customer's approval.");
+    Assert.Equal(AssignmentState.CompletedByException, Job(job).State);
+  }
+}
+
+[Test(Floor)]
+void every_unresolved_thing_on_an_assignment_can_be_listed() {
+  TestClock.Set(new DateTime(2026, 5, 4, 9, 0, 0));
+  var job = OpenPressJob();
+  Assignment? lathe = null;
+  runas (Dana) {
+    AskForApproval(Job(job), Carl, 480m, new DateTime(2026, 5, 5, 9, 0, 0));
+    lathe = OpenRepair(Machine.Single(m => m.Serial == "L-31"), Ravi);
+  }
+  runas (Tariq) {
+    var visit = AttachWork(Job(job), new WorkAttachment { Key = "visit-1", Title = "First visit", WaitingOn = Tariq });
+    BlockWork(visit, "No access to the site.");
+    CloseWork(AttachWork(Job(job), new WorkAttachment { Key = "logs", Title = "Read the logs" }), WorkState.Done, "Read.");
+  }
+  TestClock.Advance(TimeSpan.FromDays(3));
+  runas (Ravi) { NoteProgress(JobBy(lathe!.Id), "The bearing is worn", Evidence(), "ServiceLog"); }
+
+  // The manager sees which jobs need somebody, oldest progress first — and on each, exactly what is outstanding.
+  runas (Mona) {
+    Assert.Equal([job.Id], AssignmentsNeedingAttention().Select(a => a.Id).ToList());
+    var sheet = SheetOf(job.Id)!;
+    Assert.Equal(["Ask the customer to approve the cost", "First visit"], sheet.Work.Where(w => w.State == WorkState.Open).Select(w => w.Title).ToList());
+    Assert.Equal(3, sheet.Criteria.Count(c => c.State == CriterionState.Unmet));
+    Assert.Equal(["Carl Lind", "Tariq Aziz"], sheet.Conditions.NextStepWith);
+    Assert.Equal(["Blocked", "Overdue", "Stalled"], sheet.Conditions.Names());
+  }
+  // Each reader gets the ones they may read: Ravi is on the lathe only, and the lathe needs nobody.
+  runas (Ravi) { Assert.Equal(0, AssignmentsNeedingAttention().Count); }
+}
+
+[Test(Floor)]
+void somebody_who_is_not_signed_in_does_nothing() {
+  var job = OpenPressJob();
+  Assert.Equal(0, Assignment.Count());
+  Assert.Denied(() => OpenAssignment(new NewAssignment { Title = "Anybody's", Goal = "Something.", Criteria = ["Done"] }));
+  runas (Mona) { Assert.Equal(1, Assignment.Count()); }
+}
+
+// The queue's half of "unfinished work stays visible" — an assignment's open requests as items in the inbox of whoever
+// each waits on, and the audit trail naming every one — is `the_queue_and_the_audit_show_every_unresolved_item` in
+// kits/assignments-work-queues/tests/requests.test.osy: it needs the requests kit and that bridge, which this workshop
+// does not use. The assignment's own half is `every_unresolved_thing_on_an_assignment_can_be_listed` above.

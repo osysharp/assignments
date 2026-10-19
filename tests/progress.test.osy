@@ -1,0 +1,253 @@
+// Osysharp.Assignments — progress told apart from activity, and the four conditions worked out from it: waiting,
+// blocked, overdue, stalled, each with its reason; and work that waits a month for a person and then goes on.
+using Osysharp.Identity;
+using Osysharp.Assignments;
+using Workshop;
+
+DateTime Monday() { return new DateTime(2026, 5, 4, 9, 0, 0); }
+
+[Test(Floor)]
+void reminders_and_retries_do_not_reset_the_progress_clock() {
+  TestClock.Set(Monday());
+  var job = OpenPressJob();
+  runas (Tariq) {
+    var a = Job(job);
+    var wait = AttachWork(a, new WorkAttachment { Kind = WorkKind.Handoff, Key = "parts", Title = "Ask the supplier for a valve", WaitingFor = "the supplier's answer" });
+    var opened = Job(job).LastProgressAt;
+
+    // Three days of chasing: reminders, a retried call, a summary. Plenty happens; nothing is established.
+    TestClock.Advance(TimeSpan.FromDays(1));
+    NoteActivity(a, ActivityKind.Reminder, "Reminded the supplier.");
+    NoteWorkActivity(wait, ActivityKind.Retry, "Called again; no answer.");
+    TestClock.Advance(TimeSpan.FromDays(1));
+    NoteActivity(a, ActivityKind.Reminder, "Reminded the supplier again.");
+    NoteActivity(a, ActivityKind.StatusSummary, "Still waiting on the supplier.");
+    TestClock.Advance(TimeSpan.FromDays(1));
+    NoteActivity(a, ActivityKind.Note, "The customer rang to ask.");
+
+    var chased = Job(job);
+    Assert.Equal(opened, chased.LastProgressAt);
+    Assert.Equal(Monday().AddDays(3), chased.LastActivityAt);
+    // So it is stalled — the workshop allows two days — however busy it has looked.
+    var c = ConditionsOf(chased);
+    Assert.True(c.Stalled);
+    Assert.Equal("Nothing has been established since 4 May 2026 09:00 UTC; it allows 2 days. (There was activity as late as 7 May 2026 09:00 UTC, and none of it was progress.)", c.StalledWhy);
+
+    // Something established moves both clocks, and it is no longer stalled.
+    CloseWork(wait, WorkState.Done, "A valve is in stock.");
+    var moved = Job(job);
+    Assert.Equal(Monday().AddDays(3), moved.LastProgressAt);
+    Assert.False(ConditionsOf(moved).Stalled);
+  }
+}
+
+[Test(Floor)]
+void progress_points_at_what_it_rests_on_or_it_is_only_a_note() {
+  TestClock.Set(Monday());
+  var job = OpenPressJob();
+  runas (Tariq) {
+    var a = Job(job);
+    TestClock.Advance(TimeSpan.FromHours(5));
+    // "It is going well" is refused as progress.
+    Assert.Throws<ValidationException>(() => NoteProgress(a, "It is going well.", Guid.Empty, ""));
+    Assert.Throws<ValidationException>(() => NoteProgress(a, "It is going well.", Evidence(), ""));
+    Assert.Equal(Monday(), Job(job).LastProgressAt);
+
+    var log = Evidence();
+    NoteProgress(a, "The pressure log shows the fault follows a cold start", log, "ServiceLog");
+
+    var after = Job(job);
+    Assert.Equal(Monday().AddHours(5), after.LastProgressAt);
+    var line = after.Activity.Single(l => l.Kind == ActivityKind.Progress);
+    Assert.True(line.Progress);
+    Assert.Equal(log, line.Reference);
+    Assert.Equal("ServiceLog", line.ReferenceType);
+    Assert.Equal(Tariq.Id, line.By!.Id);
+    // A reminder cannot be passed off as anything else.
+    Assert.Throws<ValidationException>(() => NoteActivity(a, ActivityKind.CriterionMet, "Met, honest."));
+  }
+}
+
+[Test(Floor)]
+void an_assignment_waits_then_is_overdue_and_each_says_why() {
+  TestClock.Set(Monday());
+  var job = OpenPressJob();
+  runas (Dana) {
+    var a = Job(job);
+    Assert.True(ConditionsOf(a).Clear);
+    AskForApproval(a, Carl, 480m, Monday().AddDays(1));
+  }
+  runas (Tariq) {
+    // Inside the time allowed for the answer: it is waiting, on the customer, and nothing is wrong.
+    var c = ConditionsOf(Job(job));
+    Assert.Equal(["Waiting"], c.Names());
+    Assert.Equal(["Waiting on Carl Lind for their yes or no to 480 EUR, by 5 May 2026 09:00 UTC."], c.WaitingWhy);
+    Assert.Equal(["Carl Lind"], c.NextStepWith);
+    Assert.Equal(Monday().AddDays(1), c.NextDue);
+
+    // A day and an hour on, no answer: the same wait is now overdue.
+    TestClock.Advance(TimeSpan.FromHours(25));
+    c = ConditionsOf(Job(job));
+    Assert.Equal(["Overdue"], c.Names());
+    Assert.Equal(["“Ask the customer to approve the cost” was wanted by 5 May 2026 09:00 UTC, from Carl Lind."], c.OverdueWhy);
+    Assert.False(c.Waiting);
+  }
+}
+
+[Test(Floor)]
+void an_assignment_is_overdue_when_its_own_date_passes() {
+  TestClock.Set(Monday());
+  Assignment? job = null;
+  runas (Dana) { job = OpenRepair(Machine.Single(m => m.Serial == "L-31"), Tariq, Monday().AddDays(4)); }
+  runas (Tariq) {
+    Assert.Equal(Monday().AddDays(4), ConditionsOf(Job(job!)).NextDue);
+    NoteProgress(Job(job!), "The spindle bearing is worn", Evidence(), "ServiceLog");
+    TestClock.Advance(TimeSpan.FromDays(4).Add(TimeSpan.FromMinutes(1)));
+    NoteProgress(Job(job!), "The bearing arrived", Evidence(), "Delivery");
+    var c = ConditionsOf(Job(job!));
+    Assert.Equal(["Overdue"], c.Names());
+    Assert.Equal(["Its outcome was wanted by 8 May 2026 09:00 UTC."], c.OverdueWhy);
+  }
+  // Moving the date is recorded with the date it was and why — and only by whoever is in charge.
+  runas (Tariq) { Assert.Throws<NotAuthorized>(() => MoveAssignmentDeadline(Job(job!), Monday().AddDays(10), "More time.")); }
+  runas (Dana) {
+    MoveAssignmentDeadline(Job(job!), Monday().AddDays(10), "The customer agreed to next week.");
+    Assert.True(ConditionsOf(Job(job!)).Clear);
+    Assert.Equal("Wanted by 14 May 2026 09:00 UTC (it was 8 May 2026 09:00 UTC): The customer agreed to next week.", ActivityOf(Job(job!))[0].Said);
+  }
+}
+
+[Test(Floor)]
+void an_assignment_is_blocked_by_work_that_cannot_move_and_says_on_what() {
+  TestClock.Set(Monday());
+  var job = OpenPressJob();
+  runas (Tariq) {
+    var a = Job(job);
+    var visit = AttachWork(a, new WorkAttachment { Kind = WorkKind.Other, Key = "visit-1", Title = "First visit", WaitingOn = Tariq });
+    BlockWork(visit, "The site is closed until the safety inspection is done.");
+
+    var c = ConditionsOf(Job(job));
+    Assert.Equal(["Blocked"], c.Names());
+    Assert.Equal(["“First visit” is blocked: The site is closed until the safety inspection is done."], c.BlockedWhy);
+    Assert.Equal("“First visit” is blocked: The site is closed until the safety inspection is done.", WhyNotMoving(Job(job)));
+
+    UnblockWork(WorkOf(Job(job), "visit-1")!, "The inspection passed.");
+    Assert.Equal(["Waiting"], ConditionsOf(Job(job)).Names());
+  }
+}
+
+[Test(Floor)]
+void the_conditions_hold_together_and_a_closed_assignment_has_none() {
+  TestClock.Set(Monday());
+  Assignment? job = null;
+  runas (Dana) { job = OpenRepair(Machine.Single(m => m.Serial == "P-200"), Tariq, Monday().AddDays(2)); }
+  runas (Tariq) {
+    var a = Job(job!);
+    var visit = AttachWork(a, new WorkAttachment { Kind = WorkKind.Other, Key = "visit-1", Title = "First visit" });
+    BlockWork(visit, "No access to the site.");
+    AttachWork(a, new WorkAttachment { Kind = WorkKind.Handoff, Key = "parts", Title = "Ask the supplier for a valve", WaitingFor = "the supplier's answer", DueAt = Monday().AddDays(1) });
+    AttachWork(a, new WorkAttachment { Kind = WorkKind.Request, Key = "photos", Title = "Ask the customer for photos", WaitingOn = Carl, WaitingFor = "photos of the gauge" });
+
+    TestClock.Advance(TimeSpan.FromDays(3));
+    var c = ConditionsOf(Job(job!));
+    // Blocked, overdue twice over, stalled — and still waiting on the photos, all at once.
+    Assert.Equal(["Waiting", "Blocked", "Overdue", "Stalled"], c.Names());
+    Assert.Equal(["Waiting on Carl Lind for photos of the gauge."], c.WaitingWhy);
+    Assert.Equal(["“First visit” is blocked: No access to the site."], c.BlockedWhy);
+    Assert.Equal(["“Ask the supplier for a valve” was wanted by 5 May 2026 09:00 UTC.", "Its outcome was wanted by 6 May 2026 09:00 UTC."], c.OverdueWhy);
+    Assert.True(c.Stalled);
+    Assert.False(c.Clear);
+
+    FailAssignment(Job(job!), "The customer withdrew the press.");
+    Assert.True(ConditionsOf(Job(job!)).Clear);
+    Assert.Equal("", WhyNotMoving(Job(job!)));
+  }
+}
+
+[Test(Floor)]
+void one_stalled_branch_shows_while_another_progresses() {
+  TestClock.Set(Monday());
+  var job = OpenPressJob();
+  runas (Tariq) {
+    var a = Job(job);
+    AttachWork(a, new WorkAttachment { Kind = WorkKind.Handoff, Key = "parts", Title = "Ask the supplier for a valve", Branch = "parts" });
+    var diagnosis = AttachWork(a, new WorkAttachment { Kind = WorkKind.Other, Key = "diagnosis", Title = "Read the pressure logs", Branch = "diagnosis" });
+
+    TestClock.Advance(TimeSpan.FromDays(1));
+    ProgressWork(diagnosis, "The fault follows a cold start", Evidence(), "ServiceLog");
+    TestClock.Advance(TimeSpan.FromDays(1));
+    ProgressWork(WorkOf(Job(job), "diagnosis")!, "The pilot valve sticks below 12 degrees", Evidence(), "ServiceLog");
+    TestClock.Advance(TimeSpan.FromHours(12));
+
+    // The job as a whole moved yesterday. The parts branch has established nothing since it was opened.
+    var c = ConditionsOf(Job(job));
+    Assert.False(c.Stalled);
+    Assert.Equal(["parts"], c.StalledBranches);
+    var clocks = BranchesOf(Job(job));
+    Assert.Equal(Monday().AddDays(2), clocks.Single(b => b.Branch == "diagnosis").LastProgressAt);
+    Assert.Null(clocks.Single(b => b.Branch == "parts").LastProgressAt);
+  }
+}
+
+// ── a person answers after a month ──────────────────────────────────────────────────────────────────────────────────
+
+[Test(Floor)]
+void a_person_answers_after_thirty_days_and_the_work_continues() {
+  TestClock.Set(Monday());
+  var job = OpenPressJob();
+  RepairQuote? quote = null;
+  runas (Dana) { quote = AskForApproval(Job(job), Carl, 480m, Monday().AddDays(7)); }
+  UnitOfWork.Commit();
+
+  // Thirty days. Nothing runs, nothing is called; the job stays owned, and says exactly what it is waiting on.
+  TestClock.Advance(TimeSpan.FromDays(30));
+  Background.Settle();
+  runas (Tariq) {
+    var a = Job(job);
+    Assert.Equal(AssignmentState.Open, a.State);
+    var c = ConditionsOf(a);
+    Assert.Equal(["Overdue", "Stalled"], c.Names());
+    Assert.Equal(["Carl Lind"], c.NextStepWith);
+    Assert.Equal(WorkState.Open, WorkOf(a, "quote")!.State);
+    Assert.Equal(CriterionState.Unmet, Criterion(a, 2).State);
+  }
+
+  // The customer answers. The quote's own process goes on from where it waited: the part is ordered, the wait is
+  // closed, the criterion is met — with nobody else doing anything.
+  runas (Carl) { AnswerQuote(RepairQuote.Single(q => q.Id == quote!.Id), true); }
+  Workflow.Settle(quote!);
+
+  runas (Tariq) {
+    var a = Job(job);
+    Assert.Equal(QuoteStage.Approved, RepairQuote.Single(q => q.Id == quote!.Id).Stage);
+    Assert.Equal(1, RepairQuote.Single(q => q.Id == quote!.Id).PartsOrdered);
+    Assert.Equal(WorkState.Done, WorkOf(a, "quote")!.State);
+    Assert.Equal("The customer approved 480 EUR.", WorkOf(a, "quote")!.Result);
+    Assert.Equal(WorkState.Done, DoneFor(a, "part-order")!.State);
+    var met = Criterion(a, 2);
+    Assert.Equal(CriterionState.Met, met.State);
+    Assert.Equal(quote!.Id, met.Evidence);
+    // The answer was progress: the job is no longer stalled or overdue, a month late as it was.
+    Assert.Equal(Monday().AddDays(30), a.LastProgressAt);
+    Assert.True(ConditionsOf(a).Clear);
+  }
+}
+
+[Test(Floor)]
+void a_no_from_the_person_leaves_the_assignment_open_and_says_so() {
+  var job = OpenPressJob();
+  RepairQuote? quote = null;
+  runas (Dana) { quote = AskForApproval(Job(job), Carl, 480m, DateTime.UtcNow.AddDays(7)); }
+  UnitOfWork.Commit();
+  runas (Carl) { AnswerQuote(RepairQuote.Single(q => q.Id == quote!.Id), false); }
+  Workflow.Settle(quote!);
+  runas (Tariq) {
+    var a = Job(job);
+    Assert.Equal(QuoteStage.Declined, RepairQuote.Single(q => q.Id == quote!.Id).Stage);
+    Assert.Equal(0, RepairQuote.Single(q => q.Id == quote!.Id).PartsOrdered);
+    // Nothing was ordered, the criterion is unmet, and the job cannot be completed.
+    Assert.Null(DoneFor(a, "part-order"));
+    Assert.Equal(CriterionState.Unmet, Criterion(a, 2).State);
+    Assert.Throws<CriteriaUnmet>(() => CompleteAssignment(a, "Done."));
+  }
+}

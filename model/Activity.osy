@@ -1,0 +1,194 @@
+// What happened on an assignment, line by line — and the two clocks it keeps: the last activity, and the last progress.
+namespace Osysharp.Assignments;
+
+using Osysharp.Identity;
+
+/// What one line of an assignment's activity is. ⚠ Appended, never inserted: an enum is stored by position.
+public enum ActivityKind {
+  /// It was opened.
+  [Label("Opened")] Opened,
+  /// Something was added to what done means.
+  [Label("Criterion added")] CriterionAdded,
+  /// A criterion was met. Progress.
+  [Label("Criterion met")] CriterionMet,
+  /// A criterion that had been settled is unmet again.
+  [Label("Criterion back in question")] CriterionReopened,
+  /// Somebody accepted, in writing, that a criterion will not be met. Progress.
+  [Label("Exception accepted")] ExceptionAccepted,
+  /// A piece of work was attached.
+  [Label("Work attached")] WorkAttached,
+  /// A piece of attached work established something on the way. Progress.
+  [Label("Work moved on")] WorkProgressed,
+  /// A piece of attached work ended. Progress when it was done; activity when it failed or was cancelled.
+  [Label("Work finished")] WorkClosed,
+  /// A piece of attached work cannot move.
+  [Label("Work blocked")] WorkBlocked,
+  /// What a piece of work was blocked on is there again.
+  [Label("Work unblocked")] WorkUnblocked,
+  /// Something established that is none of the above — it points at what it rests on.
+  [Label("Progress")] Progress,
+  /// Somebody left a note. Activity, never progress.
+  [Label("Note")] Note,
+  /// Somebody was reminded. Activity, never progress.
+  [Label("Reminder")] Reminder,
+  /// Something was tried again. Activity, never progress.
+  [Label("Retry")] Retry,
+  /// A summary of where it stands was written. Activity, never progress.
+  [Label("Status summary")] StatusSummary,
+  /// A date moved — the assignment's, or a piece of work's.
+  [Label("Date moved")] DeadlineMoved,
+  /// Somebody was put on it, or what they are on it changed.
+  [Label("Participant added")] ParticipantAdded,
+  /// Somebody was taken off it.
+  [Label("Participant removed")] ParticipantRemoved,
+  /// It was linked to another assignment, or one was opened under it.
+  [Label("Linked")] Linked,
+  /// It was completed. Progress.
+  [Label("Completed")] Completed,
+  /// It was called off.
+  [Label("Called off")] Cancelled,
+  /// It was closed as failed.
+  [Label("Failed")] Failed,
+  /// It was opened again after it had been closed.
+  [Label("Opened again")] Reopened,
+}
+
+/// ⭐ ONE LINE OF AN ASSIGNMENT'S ACTIVITY: what happened, when, who did it — and whether it was PROGRESS.
+///
+/// Written once, by this package, and never changed or removed: an assignment that is reopened a year later still
+/// has every line.
+public entity AssignmentActivity {
+  [Required, Immutable, Index] Assignment Assignment;
+  /// Its place in the assignment's activity, from 1.
+  [Immutable] int Seq = 0;
+  /// The piece of attached work it is about, when it is about one.
+  [Immutable] AssignmentWork? Work;
+  [Immutable] ActivityKind Kind = ActivityKind.Note;
+  /// Whether it moved the assignment toward its outcome — something was established — or was only activity.
+  [Immutable] bool Progress = false;
+  /// What happened, in a sentence.
+  [Required, MaxLength(2000), Classification(Personal.Content)] string Said;
+  /// What it rests on: the id of a row — a piece of evidence, a finished piece of work, an event — and its kind.
+  [Immutable] Guid? Reference;
+  [Immutable, MaxLength(200)] string ReferenceType = "";
+  /// The parallel branch it happened on, as the app names its branches. "": the assignment as a whole.
+  [Immutable, MaxLength(80)] string Branch = "";
+  /// Who did it — a person, or an agent's own account. Nobody: the app itself — or, when `ByFormer`, somebody who
+  /// has since been taken off the assignment.
+  [Classification(Personal.Identity)] Principal? By;
+  bool ByFormer = false;
+  [Immutable, Index] DateTime At = DateTime.UtcNow;
+
+  security {
+    allow read when IsAuthenticated where AssignmentParticipant.Any(p => p.Assignment.Id == Assignment.Id && p.Person == user);
+    allow read when OverseesAssignments || ErasesAssignments;
+    // Made only by `RecordActivity`, which moves the assignment's own clocks in the same breath — so whoever may not
+    // change the assignment writes no line on it.
+    allow create when IsAuthenticated;
+    deny create except via RecordActivity;
+    // SECURITY-INVARIANT(an-assignments-record-changes-only-by-erasure): a line is never rewritten. Every other
+    // member is immutable, and these three are written only by the kit's erasure functions, for a caller the app's
+    // `ErasesAssignments` admits — nobody by default; not whoever asked, not the owner, not whoever oversees. A grant
+    // or an `except via` widened here lets somebody rewrite what happened on an assignment. Guarded by
+    // tests/erasure.test.osy `only_whoever_the_app_names_erases_and_only_through_the_kit`.
+    allow update when ErasesAssignments;
+    deny update Said except via TakePersonOffAssignment, AnonymiseAssignment, EraseWordsFromActivity;
+    deny update By, ByFormer except via TakePersonOffAssignment;
+    deny delete;
+  }
+}
+
+/// One line to record.
+public class ActivityNote {
+  public ActivityKind Kind = ActivityKind.Note;
+  public string Said = "";
+  public bool Progress = false;
+  public Guid? Reference;
+  public string ReferenceType = "";
+  public string Branch = "";
+  public AssignmentWork? Work;
+}
+
+/// The one place a line of activity is written, and the assignment's two clocks are moved.
+[Server, Authorize(IsAuthenticated)]
+internal AssignmentActivity RecordActivity(Assignment a, ActivityNote note) {
+  var now = DateTime.UtcNow;
+  var seq = a.Lines + 1;
+  var line = new AssignmentActivity {
+    Assignment = a, Seq = seq, Work = note.Work, Kind = note.Kind, Progress = note.Progress, Said = Clip(note.Said, 2000),
+    Reference = note.Reference, ReferenceType = note.ReferenceType, Branch = note.Branch, By = Me(), At = now,
+  };
+  a.Lines = seq;
+  a.LastActivityAt = now;
+  if (note.Progress) { a.LastProgressAt = now; }
+  if (note.Work != null) { TouchWork(note.Work!, now, note.Progress); }
+  return line;
+}
+
+/// ⭐ SOMETHING WAS ESTABLISHED — and it points at what it rests on. `reference` is the id of a durable thing: a
+/// piece of evidence in the repository, a finished piece of work, an event, a record of the app. A note of progress
+/// with nothing to point at is refused: "it is going well" is not progress.
+///
+///     NoteProgress(a, "The carrier confirmed the parcel is in the depot", scan.Id, "RepositoryItem");
+[Server, Authorize(IsAuthenticated)]
+public void NoteProgress(Assignment a, string what, Guid reference, string referenceType, string branch = "") {
+  RequireOpen(a);
+  if (what.Trim() == "") { throw new ValidationException("Say what was established."); }
+  if (reference == Guid.Empty || referenceType.Trim() == "") {
+    throw new ValidationException("Progress points at what it rests on: the id of a piece of evidence, a finished piece of work or an event, and what kind of thing it is. Without one it is a note: `NoteActivity`.");
+  }
+  RecordActivity(a, new ActivityNote { Kind = ActivityKind.Progress, Progress = true, Said = what.Trim(), Reference = reference, ReferenceType = referenceType.Trim(), Branch = branch });
+}
+
+/// Something happened that established nothing: a reminder went out, a call was tried again, a summary was
+/// written, somebody left a note. It moves the last-activity time and never the last-progress time.
+///
+///     NoteActivity(a, ActivityKind.Reminder, "Reminded Ines that her answer is wanted by Thursday.");
+[Server, Authorize(IsAuthenticated)]
+public void NoteActivity(Assignment a, ActivityKind kind, string what, string branch = "") {
+  if (kind != ActivityKind.Note && kind != ActivityKind.Reminder && kind != ActivityKind.Retry && kind != ActivityKind.StatusSummary) {
+    throw new ValidationException("`NoteActivity` records a note, a reminder, a retry or a status summary. Everything else is recorded by what does it.");
+  }
+  if (what.Trim() == "") { throw new ValidationException("Say what happened."); }
+  RecordActivity(a, new ActivityNote { Kind = kind, Said = what.Trim(), Branch = branch });
+}
+
+/// One branch of an assignment: when anything last happened on it, and when something was last established.
+public class BranchClock {
+  public string Branch = "";
+  public DateTime LastActivityAt;
+  public DateTime? LastProgressAt;
+}
+
+/// The assignment's parallel branches, each with its own two clocks — so progress on one never hides another that
+/// has gone quiet. A branch is whatever the app names on the work it attaches and the progress it notes.
+public List<BranchClock> BranchesOf(Assignment a) {
+  List<BranchClock> clocks = [];
+  foreach (var line in a.Activity.Where(l => l.Branch != "").OrderBy(l => l.Seq).ToList()) {
+    var clock = clocks.FirstOrDefault(c => c.Branch == line.Branch);
+    if (clock == null) { clock = new BranchClock { Branch = line.Branch, LastActivityAt = line.At }; clocks.Add(clock!); }
+    clock!.LastActivityAt = line.At;
+    if (line.Progress) { clock!.LastProgressAt = line.At; }
+  }
+  return clocks;
+}
+
+/// One line of activity as a page shows it.
+public class ActivityLine {
+  public Guid Id;
+  public ActivityKind Kind = ActivityKind.Note;
+  public bool Progress = false;
+  public string Said = "";
+  public string By = "";
+  public string Branch = "";
+  public DateTime At;
+}
+
+/// An assignment's activity, newest first.
+public List<ActivityLine> ActivityOf(Assignment a, int take = 50) {
+  List<ActivityLine> lines = [];
+  foreach (var l in a.Activity.OrderByDescending(l => l.Seq).ThenByDescending(l => l.At).Take(take).ToList()) {
+    lines.Add(new ActivityLine { Id = l.Id, Kind = l.Kind, Progress = l.Progress, Said = l.Said, By = l.ByFormer ? FormerPersonWords() : NameOf(l.By), Branch = l.Branch, At = l.At });
+  }
+  return lines;
+}

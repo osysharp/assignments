@@ -1,0 +1,254 @@
+// Osysharp.Assignments — what done means: an assignment declares its criteria, each is met with what met it, and it
+// completes only when all of them are met or somebody the app trusts accepts a written exception. A closed one is
+// opened again with everything it had.
+using Osysharp.Identity;
+using Osysharp.Assignments;
+using Workshop;
+
+[Test(Floor)]
+void an_assignment_says_who_asked_the_outcome_wanted_and_what_done_means() {
+  var job = OpenPressJob();
+  runas (Dana) {
+    var a = Job(job);
+    Assert.Equal("Press P-200 faults intermittently", a.Title);
+    Assert.Equal("The press runs a full shift without faulting.", a.Goal);
+    Assert.Equal(Dana.Id, a.Requester.Id);
+    Assert.Equal(AssignmentState.Open, a.State);
+    Assert.Equal(["The cause is found", "The customer approved the cost", "The press ran clean for a shift"],
+                 a.Criteria.OrderBy(c => c.Position).ToList().Select(c => c.Text).ToList());
+    Assert.True(a.Criteria.All(c => c.State == CriterionState.Unmet));
+    // Whoever asked and whoever does the work are on it from the start.
+    Assert.Equal(ParticipantRole.Requester, a.Participants.Single(p => p.Person.Id == Dana.Id).Role);
+    Assert.Equal(ParticipantRole.Assignee, a.Participants.Single(p => p.Person.Id == Tariq.Id).Role);
+    // The workshop's own record points at it.
+    Assert.Equal(a.Id, Machine.Single(m => m.Serial == "P-200").Job!.Id);
+    Assert.Equal("Opened: The press runs a full shift without faulting.", ActivityOf(a)[0].Said);
+  }
+}
+
+[Test(Floor)]
+void completing_is_refused_while_a_criterion_is_unmet_however_much_work_has_finished() {
+  var job = OpenPressJob();
+  runas (Tariq) {
+    var a = Job(job);
+    // Every piece of work attached to it finishes.
+    var visit = AttachWork(a, new WorkAttachment { Kind = WorkKind.Other, Key = "visit-1", Title = "First visit" });
+    CloseWork(visit, WorkState.Done, "Valve replaced.");
+    MeetCriterion(Criterion(a, 1), "A worn pilot valve", evidence: Evidence(), evidenceType: "ServiceLog");
+    MeetCriterion(Criterion(a, 2), "Approved by phone, noted by the desk");
+
+    var refused = Assert.Throws<CriteriaUnmet>(() => CompleteAssignment(a, "Fixed."));
+    Assert.Equal("“Press P-200 faults intermittently” cannot be completed. 1 of 3 criteria is not met: “The press ran clean for a shift”.", refused.Message);
+    Assert.Equal(AssignmentState.Open, Job(job).State);
+    Assert.False(CompletionOf(a).Ready);
+    Assert.Equal(1, CompletionOf(a).Unmet.Count);
+  }
+}
+
+[Test(Floor)]
+void a_criterion_is_met_with_what_met_it_and_never_just_ticked() {
+  var job = OpenPressJob();
+  runas (Tariq) {
+    var a = Job(job);
+    var scan = Evidence();
+    Assert.Throws<ValidationException>(() => MeetCriterion(Criterion(a, 1), "  "));
+
+    MeetCriterion(Criterion(a, 1), "A worn pilot valve, seen on the pressure log", evidence: scan, evidenceType: "ServiceLog");
+
+    var met = Criterion(Job(job), 1);
+    Assert.Equal(CriterionState.Met, met.State);
+    Assert.Equal("A worn pilot valve, seen on the pressure log", met.MetBy);
+    Assert.Equal(scan, met.Evidence);
+    Assert.Equal("ServiceLog", met.EvidenceType);
+    Assert.Equal(Tariq.Id, met.SettledBy!.Id);
+    Assert.NotNull(met.SettledAt);
+    Assert.Equal("Met: “The cause is found” — A worn pilot valve, seen on the pressure log", ActivityOf(a)[0].Said);
+    Assert.True(ActivityOf(a)[0].Progress);
+  }
+}
+
+[Test(Floor)]
+void an_assignment_with_every_criterion_met_completes_and_says_how_it_ended() {
+  var job = OpenPressJob();
+  runas (Tariq) {
+    var a = Job(job);
+    MeetCriterion(Criterion(a, 1), "A worn pilot valve");
+    MeetCriterion(Criterion(a, 2), "Approved by phone");
+    MeetCriterion(Criterion(a, 3), "Eight hours on 14 May with no fault");
+    Assert.True(CompletionOf(a).Ready);
+
+    CompleteAssignment(a, "The valve was replaced and the press ran clean.", limitations: "The spare valve was not tested.",
+                       obligations: "Check the seals at the next service.");
+
+    var done = Job(job);
+    Assert.Equal(AssignmentState.Completed, done.State);
+    Assert.Equal("The valve was replaced and the press ran clean.", done.Outcome);
+    Assert.Equal("The spare valve was not tested.", done.Limitations);
+    Assert.Equal("Check the seals at the next service.", done.Obligations);
+    Assert.Equal(Tariq.Id, done.ClosedBy!.Id);
+    Assert.NotNull(done.ClosedAt);
+    // Closed: nothing more is done on it until it is opened again.
+    Assert.Throws<AssignmentClosed>(() => AddCriterion(done, "One more thing"));
+    Assert.Throws<AssignmentClosed>(() => AttachWork(done, new WorkAttachment { Title = "Another visit" }));
+  }
+}
+
+[Test(Floor)]
+void an_assignment_that_says_nothing_about_done_cannot_be_completed() {
+  runas (Dana) {
+    var a = OpenAssignment(new NewAssignment { Title = "Look at the lathe", Goal = "The lathe is looked at." });
+    var refused = Assert.Throws<CriteriaUnmet>(() => CompleteAssignment(a, "Looked."));
+    Assert.Contains("It says nothing about what done means yet: add a criterion.", refused.Message);
+
+    AddCriterion(a, "A technician has inspected it", key: "inspected");
+    MeetCriterion(CriterionOf(a, "inspected"), "Ravi inspected it on Tuesday");
+    CompleteAssignment(a, "Inspected; nothing found.");
+    Assert.Equal(AssignmentState.Completed, Assignment.Single(x => x.Id == a.Id).State);
+  }
+}
+
+[Test(Floor)]
+void an_exception_is_accepted_in_writing_only_by_whoever_the_app_trusts_with_it() {
+  var job = OpenPressJob();
+  runas (Tariq) {
+    var a = Job(job);
+    MeetCriterion(Criterion(a, 1), "A worn pilot valve");
+    MeetCriterion(Criterion(a, 3), "Eight hours with no fault");
+    // The technician may not wave the customer's approval through — nor may the desk, who asked for the job.
+    Assert.Denied(() => AcceptException(Criterion(a, 2), "They always pay."));
+  }
+  runas (Dana) { Assert.Denied(() => AcceptException(Criterion(Job(job), 2), "They always pay.")); }
+  runas (Tariq) { Assert.Throws<CriteriaUnmet>(() => CompleteAssignment(Job(job), "Fixed.")); }
+
+  runas (Mona) {
+    var a = Job(job);
+    Assert.Throws<ValidationException>(() => AcceptException(Criterion(a, 2), ""));
+    AcceptException(Criterion(a, 2), "Covered by the service contract; no approval is needed.");
+  }
+  runas (Tariq) {
+    var a = Job(job);
+    Assert.True(CompletionOf(a).Ready);
+    Assert.True(CompletionOf(a).ByException);
+    CompleteAssignment(a, "Fixed under the service contract.");
+
+    var done = Job(job);
+    Assert.Equal(AssignmentState.CompletedByException, done.State);
+    var excepted = Criterion(done, 2);
+    Assert.Equal(CriterionState.Excepted, excepted.State);
+    Assert.Equal("Covered by the service contract; no approval is needed.", excepted.ExceptionWhy);
+    Assert.Equal(Mona.Id, excepted.SettledBy!.Id);
+    Assert.Contains("Exception accepted by Mona Berg for “The customer approved the cost”: Covered by the service contract; no approval is needed.",
+                    ActivityOf(done).Select(l => l.Said).ToList());
+  }
+}
+
+[Test(Floor)]
+void a_completed_assignment_is_opened_again_with_everything_it_had() {
+  var job = OpenPressJob();
+  var log = Evidence();
+  runas (Tariq) {
+    var a = Job(job);
+    var visit = AttachWork(a, new WorkAttachment { Kind = WorkKind.Other, Key = "visit-1", Title = "First visit" });
+    CloseWork(visit, WorkState.Done, "Valve replaced.");
+    MeetCriterion(Criterion(a, 1), "A worn pilot valve", evidence: log, evidenceType: "ServiceLog");
+    MeetCriterion(Criterion(a, 2), "Approved by phone");
+    MeetCriterion(Criterion(a, 3), "Eight hours with no fault");
+    CompleteAssignment(a, "The valve was replaced and the press ran clean.");
+  }
+  var linesBefore = 0;
+  runas (Dana) { linesBefore = Job(job).Activity.Count(); }
+
+  // Two days later the press faults again. The same job is opened again — not a new one.
+  runas (Dana) {
+    var a = Job(job);
+    Assert.Throws<ValidationException>(() => ReopenAssignment(a, ""));
+    ReopenAssignment(a, "The press faulted again after two days.", [Criterion(a, 1), Criterion(a, 3)]);
+  }
+  runas (Tariq) {
+    var a = Job(job);
+    Assert.Equal(AssignmentState.Open, a.State);
+    Assert.Equal(1, a.Reopened);
+    Assert.Equal("", a.Outcome);
+    Assert.Null(a.ClosedAt);
+    // The two criteria named are back in question; the customer's approval still stands.
+    Assert.Equal(CriterionState.Unmet, Criterion(a, 1).State);
+    Assert.Equal(CriterionState.Met, Criterion(a, 2).State);
+    Assert.Equal(CriterionState.Unmet, Criterion(a, 3).State);
+    Assert.Equal(1, Criterion(a, 3).Reopened);
+    // Everything it had is still there: the visit, and every line of what happened — the first ending among them.
+    Assert.Equal(WorkState.Done, WorkOf(a, "visit-1")!.State);
+    Assert.True(a.Activity.Count() > linesBefore);
+    var said = ActivityOf(a, 100).Select(l => l.Said).ToList();
+    Assert.Contains("Completed: The valve was replaced and the press ran clean.", said);
+    Assert.Contains("Opened again: The press faulted again after two days. (It was completed: The valve was replaced and the press ran clean.)", said);
+    Assert.Contains("Back in question: “The cause is found” — The press faulted again after two days. (It was met by: A worn pilot valve.)", said);
+    Assert.Throws<CriteriaUnmet>(() => CompleteAssignment(a, "Fixed again."));
+
+    // The second look finds the real cause, and the job completes a second time.
+    MeetCriterion(Criterion(a, 1), "A cracked manifold, which the valve had been masking");
+    MeetCriterion(Criterion(a, 3), "Three shifts with no fault");
+    CompleteAssignment(a, "The manifold was replaced.");
+    Assert.Equal(AssignmentState.Completed, Job(job).State);
+    Assert.Equal(1, Job(job).Reopened);
+  }
+}
+
+[Test(Floor)]
+void reopening_with_nothing_named_puts_every_met_criterion_back_in_question() {
+  var job = OpenPressJob();
+  runas (Tariq) {
+    var a = Job(job);
+    MeetCriterion(Criterion(a, 1), "A worn pilot valve");
+    MeetCriterion(Criterion(a, 2), "Approved by phone");
+    MeetCriterion(Criterion(a, 3), "Eight hours with no fault");
+    CompleteAssignment(a, "Fixed.");
+  }
+  runas (Mona) { ReopenAssignment(Job(job), "The customer disputes all of it."); }
+  runas (Tariq) {
+    Assert.True(Job(job).Criteria.All(c => c.State == CriterionState.Unmet));
+    Assert.Equal(3, CompletionOf(Job(job)).Unmet.Count);
+  }
+}
+
+[Test(Floor)]
+void calling_an_assignment_off_closes_the_work_still_open_on_it() {
+  var job = OpenPressJob();
+  runas (Tariq) {
+    var a = Job(job);
+    AttachWork(a, new WorkAttachment { Kind = WorkKind.Other, Key = "visit-1", Title = "First visit" });
+    var parts = AttachWork(a, new WorkAttachment { Kind = WorkKind.Handoff, Key = "parts", Title = "Ask the supplier for a valve" });
+    CloseWork(parts, WorkState.Done, "In stock.");
+  }
+  runas (Dana) {
+    var a = Job(job);
+    Assert.Throws<ValidationException>(() => CancelAssignment(a, ""));
+    CancelAssignment(a, "The customer scrapped the press.");
+
+    var off = Job(job);
+    Assert.Equal(AssignmentState.Cancelled, off.State);
+    Assert.Equal("The customer scrapped the press.", off.Outcome);
+    Assert.Equal(WorkState.Cancelled, WorkOf(off, "visit-1")!.State);
+    Assert.Equal("The assignment was called off.", WorkOf(off, "visit-1")!.Result);
+    // What had finished stays as it ended.
+    Assert.Equal(WorkState.Done, WorkOf(off, "parts")!.State);
+  }
+}
+
+[Test(Floor)]
+void an_assignment_that_failed_keeps_what_was_established() {
+  var job = OpenPressJob();
+  runas (Tariq) {
+    var a = Job(job);
+    MeetCriterion(Criterion(a, 1), "A cracked frame");
+    FailAssignment(a, "The frame cannot be repaired.", limitations: "Whether the hydraulics are sound was not established.");
+
+    var failed = Job(job);
+    Assert.Equal(AssignmentState.Failed, failed.State);
+    Assert.Equal("The frame cannot be repaired.", failed.Outcome);
+    Assert.Equal("Whether the hydraulics are sound was not established.", failed.Limitations);
+    // The criteria are as they stood: one established, two not.
+    Assert.Equal(CriterionState.Met, Criterion(failed, 1).State);
+    Assert.Equal("A cracked frame", Criterion(failed, 1).MetBy);
+    Assert.Equal(CriterionState.Unmet, Criterion(failed, 3).State);
+  }
+}

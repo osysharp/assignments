@@ -1,0 +1,43 @@
+// The workshop the tests run in: the desk, two technicians, the manager, a customer, and a press that faults.
+using Osysharp.Identity;
+using Osysharp.Assignments;
+using Workshop;
+
+[TestFixture]
+void Floor() {
+  var dana  = new Person { Email = "dana@workshop.example",  DisplayName = "Dana Holm" };
+  var tariq = new Person { Email = "tariq@workshop.example", DisplayName = "Tariq Aziz" };
+  var ravi  = new Person { Email = "ravi@workshop.example",  DisplayName = "Ravi Nair" };
+  var mona  = new Person { Email = "mona@workshop.example",  DisplayName = "Mona Berg" };
+  var carl  = new Person { Email = "carl@pressworks.example", DisplayName = "Carl Lind" };
+  new RoleGrant { Member = dana,  Role = WorkshopRole.Desk };
+  new RoleGrant { Member = tariq, Role = WorkshopRole.Technician };
+  new RoleGrant { Member = ravi,  Role = WorkshopRole.Technician };
+  new RoleGrant { Member = mona,  Role = WorkshopRole.Manager };
+  new RoleGrant { Member = carl,  Role = WorkshopRole.Customer };
+  var rosa  = new Person { Email = "rosa@workshop.example",  DisplayName = "Rosa Lund" };
+  new RoleGrant { Member = rosa,  Role = WorkshopRole.Records };
+  new Machine { Serial = "P-200", Model = "Hydraulic press" };
+  new Machine { Serial = "L-31", Model = "Lathe" };
+}
+
+principal Dana  => Person.Single(p => p.Email == "dana@workshop.example");
+principal Tariq => Person.Single(p => p.Email == "tariq@workshop.example");
+principal Ravi  => Person.Single(p => p.Email == "ravi@workshop.example");
+principal Mona  => Person.Single(p => p.Email == "mona@workshop.example");
+principal Carl  => Person.Single(p => p.Email == "carl@pressworks.example");
+principal Rosa  => Person.Single(p => p.Email == "rosa@workshop.example");
+
+/// The press's job, opened by the desk with Tariq on it — and read back as whoever asks.
+Assignment OpenPressJob() {
+  Assignment? job = null;
+  runas (Dana) { job = OpenRepair(Machine.Single(m => m.Serial == "P-200"), Tariq); }
+  return job!;
+}
+
+/// The job, read again as whoever is running.
+Assignment Job(Assignment job) { return JobBy(job.Id); }
+Assignment JobBy(Guid id) { return Assignment.Single(a => a.Id == id); }
+
+/// A stand-in for the id of a piece of evidence: a scan, a log, a photo.
+Guid Evidence() { return Guid.NewGuid(); }

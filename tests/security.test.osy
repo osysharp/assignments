@@ -1,0 +1,185 @@
+// Osysharp.Assignments — who sees an assignment and who may act on it: whoever is on it, whoever the app's policies
+// admit, and nobody else; and nothing of it is written except by the kit's own functions.
+using Osysharp.Identity;
+using Osysharp.Assignments;
+using Workshop;
+
+[Test(Floor)]
+void an_assignment_is_read_by_whoever_is_on_it_and_by_nobody_else() {
+  var job = OpenPressJob();
+  runas (Tariq) {
+    var a = Job(job);
+    AttachWork(a, new WorkAttachment { Kind = WorkKind.Other, Key = "visit-1", Title = "First visit" });
+    MeetCriterion(Criterion(a, 1), "A worn pilot valve");
+  }
+  // Whoever asked and whoever does the work read all of it.
+  runas (Dana) {
+    Assert.Equal(1, Assignment.Count());
+    Assert.Equal(3, AssignmentCriterion.Count());
+    Assert.Equal(1, AssignmentWork.Count());
+    Assert.True(AssignmentActivity.Count() >= 3);
+    Assert.Equal(2, AssignmentParticipant.Count());
+  }
+  // The manager oversees every assignment.
+  runas (Mona) { Assert.Equal(1, Assignment.Count()); Assert.Equal(3, AssignmentCriterion.Count()); }
+  // Another technician, and the customer, are not on it: they read nothing of it.
+  runas (Ravi) {
+    Assert.Equal(0, Assignment.Count());
+    Assert.Equal(0, AssignmentCriterion.Count());
+    Assert.Equal(0, AssignmentWork.Count());
+    Assert.Equal(0, AssignmentActivity.Count());
+    Assert.Equal(0, AssignmentParticipant.Count());
+  }
+  runas (Carl) { Assert.Equal(0, Assignment.Count()); Assert.Equal(0, AssignmentActivity.Count()); }
+}
+
+[Test(Floor)]
+void only_whoever_the_app_lets_ask_for_work_opens_an_assignment() {
+  runas (Tariq) {
+    Assert.Denied(() => OpenAssignment(new NewAssignment { Title = "My own job", Goal = "Something.", Criteria = ["Done"] }));
+  }
+  runas (Carl) {
+    Assert.Denied(() => OpenAssignment(new NewAssignment { Title = "Fix it for free", Goal = "Something.", Criteria = ["Done"] }));
+  }
+  runas (Mona) { Assert.Equal(0, Assignment.Count()); }
+}
+
+[Test(Floor)]
+void an_observer_reads_and_changes_nothing() {
+  var job = OpenPressJob();
+  runas (Dana) { AddParticipant(Job(job), Carl, ParticipantRole.Observer); }
+  runas (Carl) {
+    var a = Job(job);
+    Assert.Equal("Press P-200 faults intermittently", a.Title);
+    Assert.Equal(3, a.Criteria.Count());
+    Assert.Denied(() => MeetCriterion(Criterion(a, 2), "I approve, obviously"));
+    Assert.Denied(() => AttachWork(a, new WorkAttachment { Title = "A visit I would like" }));
+    Assert.Denied(() => NoteProgress(a, "It works now", Evidence(), "Photo"));
+    Assert.Denied(() => AddCriterion(a, "And a free service"));
+  }
+  runas (Dana) {
+    Assert.True(Job(job).Criteria.All(c => c.State == CriterionState.Unmet));
+    Assert.Equal(0, Job(job).Work.Count());
+  }
+  // With every criterion met, completing it is still not an observer's to do.
+  runas (Tariq) {
+    MeetCriterion(Criterion(Job(job), 1), "A worn pilot valve");
+    MeetCriterion(Criterion(Job(job), 2), "Approved by phone");
+    MeetCriterion(Criterion(Job(job), 3), "Eight hours with no fault");
+  }
+  runas (Carl) { Assert.Denied(() => CompleteAssignment(Job(job), "Done, I say.")); }
+  runas (Dana) { Assert.Equal(AssignmentState.Open, Job(job).State); }
+}
+
+[Test(Floor)]
+void only_whoever_is_in_charge_calls_it_off_reopens_it_or_puts_people_on_it() {
+  var job = OpenPressJob();
+  // Tariq works on it — and is not in charge of it.
+  runas (Tariq) {
+    var a = Job(job);
+    Assert.Throws<NotAuthorized>(() => CancelAssignment(a, "I would rather not."));
+    Assert.Throws<NotAuthorized>(() => AddParticipant(a, Ravi, ParticipantRole.Assignee));
+    Assert.Throws<NotAuthorized>(() => RemoveParticipant(a, Dana));
+    Assert.Throws<NotAuthorized>(() => SetAssignmentOwner(a, Tariq));
+    Assert.Throws<NotAuthorized>(() => SetAssignmentBudget(a, 100m));
+  }
+  // Whoever asked is; so is whoever owns it, once named; so is the manager.
+  runas (Dana) {
+    SetAssignmentOwner(Job(job), Ravi);
+    Assert.Equal(Ravi.Id, Job(job).Owner!.Id);
+    // The requester and the owner stay on it.
+    Assert.Throws<ValidationException>(() => RemoveParticipant(Job(job), Ravi));
+  }
+  runas (Ravi) {
+    AddParticipant(Job(job), Carl, ParticipantRole.Observer);
+    RemoveParticipant(Job(job), Carl);
+  }
+  runas (Mona) { CancelAssignment(Job(job), "The customer went elsewhere."); }
+  runas (Tariq) { Assert.Throws<NotAuthorized>(() => ReopenAssignment(Job(job), "I disagree.")); }
+  runas (Ravi) {
+    ReopenAssignment(Job(job), "They came back.");
+    Assert.Equal(AssignmentState.Open, Job(job).State);
+  }
+}
+
+[Test(Floor)]
+void revoking_a_permission_mid_assignment_stops_the_next_read_and_write() {
+  var job = OpenPressJob();
+  runas (Dana) { AddParticipant(Job(job), Ravi, ParticipantRole.Assignee); }
+  Guid visit = Guid.Empty;
+  runas (Ravi) {
+    // Ravi is on it: he reads it, attaches work and meets a criterion.
+    var a = Job(job);
+    visit = AttachWork(a, new WorkAttachment { Kind = WorkKind.Other, Key = "visit-1", Title = "First visit" }).Id;
+    MeetCriterion(Criterion(a, 1), "A worn pilot valve");
+  }
+
+  // Mid-assignment he is taken off it. Nothing of his is undone; what he did stays, under his name.
+  runas (Dana) { RemoveParticipant(Job(job), Ravi); }
+
+  runas (Ravi) {
+    // The next read finds nothing — not the assignment, nor anything of it.
+    Assert.Equal(0, Assignment.Count());
+    Assert.Equal(0, AssignmentCriterion.Count());
+    Assert.Equal(0, AssignmentWork.Count(w => w.Id == visit));
+    Assert.Equal(0, AssignmentActivity.Count());
+  }
+  // The next write is refused — a row he was handed before he was taken off is no longer his to pass to anything.
+  Assignment? held = null;
+  AssignmentCriterion? heldCriterion = null;
+  AssignmentWork? heldWork = null;
+  runas (Dana) { held = Job(job); heldCriterion = Criterion(held!, 3); heldWork = WorkOf(held!, "visit-1"); }
+  runas (Ravi) {
+    Assert.Contains("the current caller cannot read", Assert.Throws<Exception>(() => MeetCriterion(heldCriterion!, "Ran clean, I promise")).Message);
+    Assert.Contains("the current caller cannot read", Assert.Throws<Exception>(() => CloseWork(heldWork!, WorkState.Done, "All good.")).Message);
+    Assert.Contains("the current caller cannot read", Assert.Throws<Exception>(() => NoteProgress(held!, "Fixed", Evidence(), "Photo")).Message);
+    Assert.Contains("the current caller cannot read", Assert.Throws<Exception>(() => CompleteAssignment(held!, "Done.")).Message);
+  }
+  runas (Dana) {
+    var a = Job(job);
+    Assert.Equal(CriterionState.Unmet, Criterion(a, 3).State);
+    Assert.Equal(WorkState.Open, WorkOf(a, "visit-1")!.State);
+    // What he did while he was on it is still there, and still his.
+    Assert.Equal(CriterionState.Met, Criterion(a, 1).State);
+    Assert.Equal(Ravi.Id, Criterion(a, 1).SettledBy!.Id);
+    Assert.Contains("Ravi Nair is no longer on it.", ActivityOf(a).Select(l => l.Said).ToList());
+  }
+}
+
+[Test(Floor)]
+void nothing_of_an_assignment_is_written_except_by_the_kit() {
+  var job = OpenPressJob();
+  runas (Tariq) {
+    var a = Job(job);
+    var visit = AttachWork(a, new WorkAttachment { Kind = WorkKind.Other, Key = "visit-1", Title = "First visit" });
+    CountWorkCost(visit, 4000);
+    UnitOfWork.Commit();
+    // Tariq works on this job, and may change it through the kit. Writing its rows himself is another matter.
+    Assert.Denied(() => ForceClosed(Job(job)));
+    Assert.Denied(() => TickCriterion(Criterion(Job(job), 3)));
+    Assert.Denied(() => ForgeProgress(Job(job)));
+    Assert.Denied(() => ForgeSeat(Job(job), Ravi));
+    Assert.Denied(() => RewriteCost(WorkOf(Job(job), "visit-1")!));
+  }
+  runas (Dana) { Assert.Denied(() => ForgeAssignment(Dana)); }
+  runas (Dana) {
+    var a = Job(job);
+    Assert.Equal(AssignmentState.Open, a.State);
+    Assert.Equal(CriterionState.Unmet, Criterion(a, 3).State);
+    Assert.Equal(0, a.Activity.Count(l => l.Said == "Going well."));
+    Assert.Equal(2, a.Participants.Count());
+    Assert.Equal(4000, WorkOf(a, "visit-1")!.CostMicros);
+    Assert.Equal(1, Assignment.Count());
+  }
+}
+
+/// A row a kit's function made is the kit's from the moment it is made: a column written on it by other code before
+/// the unit of work commits is judged at the write, like a write to a stored row.
+[Test(Floor)]
+void a_row_the_kit_made_is_not_rewritten_before_the_request_ends() {
+  var job = OpenPressJob();
+  runas (Tariq) {
+    Assert.Denied(() => AttachThenRewrite(Job(job)));
+    Assert.Denied(() => AddThenTick(Job(job)));
+  }
+}

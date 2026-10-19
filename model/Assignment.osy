@@ -1,0 +1,403 @@
+// The assignment: who asked, the outcome wanted, who owns it, where it stands — and who is on it.
+namespace Osysharp.Assignments;
+
+using Osysharp.Identity;
+
+/// Where an assignment stands. ⚠ Appended, never inserted: an enum is stored by position.
+public enum AssignmentState {
+  /// It is owned and unfinished — whatever is or is not running for it right now.
+  [Label("Open")] Open,
+  /// Every criterion was met.
+  [Label("Completed")] Completed,
+  /// It was closed with a criterion unmet, each of those covered by an exception somebody accepted in writing.
+  [Label("Completed by exception")] CompletedByException,
+  /// Whoever asked, or whoever owns it, called it off.
+  [Label("Cancelled")] Cancelled,
+  /// It could not be done. What was established stays with it.
+  [Label("Failed")] Failed,
+}
+
+/// ⭐ AN ASSIGNMENT: a piece of work somebody asked for, owned until its outcome is reached.
+///
+///     var a = OpenAssignment(new NewAssignment {
+///       Title = "Order 1042 has not arrived",
+///       Goal = "The customer has the order, or their money back, before Friday.",
+///       Criteria = ["The parcel is delivered or the order is refunded", "The customer has been told"],
+///     });
+///
+/// Made and closed only by this package's own functions. An app reads it — and adds what its own work needs
+/// (`partial entity Assignment { Order? Order; }`), or points at it from a record of its own (`Assignment? Case;`).
+[Authority(Extensible)]
+public entity Assignment {
+  /// What it is called in a list.
+  [Required, MaxLength(200), Classification(Personal.Content)] string Title;
+  /// The outcome wanted, in words — what whoever asked wants to be true when this is over.
+  [Required, MaxLength(4000), Classification(Personal.Content)] string Goal;
+  /// What is in and out of it, when that needs saying.
+  [MaxLength(4000), Classification(Personal.Content)] string Scope = "";
+
+  /// Who asked. Nobody: whoever asked was taken off it (`TakePersonOffAssignment`).
+  [Index, Classification(Personal.Identity)] Principal? Requester;
+  /// Who is accountable for it reaching its outcome. Nobody: it is whoever asked.
+  [Index, Classification(Personal.Identity)] Principal? Owner;
+
+  AssignmentState State = AssignmentState.Open;
+
+  /// The assignment this one was opened under, and the one at the top. Null: this is the top.
+  [Immutable, Index] Assignment? Parent;
+  [Immutable, Index] Assignment? Root;
+  [Immutable] int Depth = 0;
+
+  /// The process it follows and that process's version when it was opened, when it follows one — as the app names them.
+  [Immutable, MaxLength(200)] string Process = "";
+  [Immutable, MaxLength(40)] string ProcessVersion = "";
+
+  [Immutable] DateTime OpenedAt = DateTime.UtcNow;
+  /// When the outcome is wanted by. Null: no date was asked for.
+  DateTime? DueAt;
+  /// How many minutes it may go without meaningful progress before it is stalled. 0: the app's `StalledAfter`.
+  [Min(0)] int StalledAfterMinutes = 0;
+
+  /// The last time anything happened on it at all — a reminder and a retry count.
+  DateTime LastActivityAt = DateTime.UtcNow;
+  /// The last time something was ESTABLISHED: a criterion met, a piece of work finished, a note of progress that
+  /// points at what it rests on. A reminder, a retry and a status summary never move it.
+  DateTime LastProgressAt = DateTime.UtcNow;
+
+  /// How many lines its activity has: each line's place in it.
+  int Lines = 0;
+
+  /// The most it may spend on models, in millionths of a US dollar. 0: it is counted, and not limited.
+  [Min(0)] long BudgetMicros = 0;
+
+  /// How it ended, in words: the outcome, what it could not establish, and what somebody still owes after it.
+  [MaxLength(4000), Classification(Personal.Content)] string Outcome = "";
+  [MaxLength(4000), Classification(Personal.Content)] string Limitations = "";
+  [MaxLength(4000), Classification(Personal.Content)] string Obligations = "";
+  DateTime? ClosedAt;
+  [Classification(Personal.Identity)] Principal? ClosedBy;
+  /// How many times it was opened again after it had been closed.
+  int Reopened = 0;
+  /// When what it says was erased or scrubbed of the person it was about (`AnonymiseAssignment`), and why.
+  DateTime? AnonymisedAt;
+  [MaxLength(300)] string ErasedWhy = "";
+
+  [ForeignKey(Assignment)] AssignmentCriterion[] Criteria;
+  [ForeignKey(Assignment)] AssignmentParticipant[] Participants;
+  [ForeignKey(Assignment)] AssignmentWork[] Work;
+  [ForeignKey(Assignment)] AssignmentActivity[] Activity;
+  [ForeignKey(Parent)] Assignment[] Children;
+
+  security {
+    // Whoever is on it reads it — and so does whoever is on an assignment it was opened under.
+    allow read when IsAuthenticated where AssignmentParticipant.Any(p => p.Assignment.Id == Id && p.Person == user);
+    allow read when OverseesAssignments || ErasesAssignments;
+    allow create when OpensAssignments || OverseesAssignments;
+    // Whoever works on it changes it; somebody who only watches, or is on an assignment above, does not.
+    allow update when IsAuthenticated where AssignmentParticipant.Any(p => p.Assignment.Id == Id && p.Person == user && p.Acts);
+    allow update when OverseesAssignments || ErasesAssignments;
+    deny create except via OpenAssignment;
+    deny update State, ClosedAt except via CloseAssignmentAs, ReopenAssignment;
+    // How it ended in words, and who closed it, also change when a person is taken off it or its words are erased.
+    deny update Outcome, Limitations, Obligations except via CloseAssignmentAs, ReopenAssignment, TakePersonOffAssignment, AnonymiseAssignment;
+    deny update ClosedBy except via CloseAssignmentAs, ReopenAssignment, TakePersonOffAssignment;
+    deny update Reopened except via ReopenAssignment;
+    deny update Owner except via SetAssignmentOwner, TakePersonOffAssignment;
+    deny update Requester except via TakePersonOffAssignment;
+    deny update AnonymisedAt, ErasedWhy except via AnonymiseAssignment;
+    deny update DueAt except via MoveAssignmentDeadline;
+    deny update StalledAfterMinutes except via SetStalledAfter;
+    deny update BudgetMicros except via SetAssignmentBudget;
+    deny update LastActivityAt, LastProgressAt, Lines except via RecordActivity;
+    deny delete;
+  }
+}
+
+/// What somebody is on an assignment. ⚠ Appended, never inserted.
+public enum ParticipantRole {
+  /// Asked for it.
+  [Label("Requester")] Requester,
+  /// Is accountable for it reaching its outcome.
+  [Label("Owner")] Owner,
+  /// Does the work — a person, or an agent's own account.
+  [Label("Assignee")] Assignee,
+  /// Adds to it: evidence, an answer, a decision.
+  [Label("Contributor")] Contributor,
+  /// Follows it, and changes nothing.
+  [Label("Observer")] Observer,
+  /// Is on an assignment this one was opened under: reads it, and changes nothing.
+  [Label("From above")] Above,
+}
+
+/// ⭐ SOMEBODY ON AN ASSIGNMENT — a person, or an agent's own account. Being on it is what lets them read it; `Acts`
+/// is what lets them change it.
+///
+/// Whoever asked and whoever owns it are on it from the start. Whoever is on an assignment is on everything opened
+/// under it, as `Above`. Made and removed only by this package's own functions.
+[Unique(Assignment, Person)]
+public entity AssignmentParticipant {
+  [Required, Immutable, Index] Assignment Assignment;
+  [Required, Immutable, Index, Classification(Personal.Identity)] Principal Person;
+  ParticipantRole Role = ParticipantRole.Contributor;
+  /// Whether they may change the assignment: every role but `Observer` and `Above`.
+  bool Acts = true;
+  [Immutable] DateTime Since = DateTime.UtcNow;
+
+  security {
+    allow read when IsAuthenticated where Person == user
+      || AssignmentParticipant.Any(p => p.Assignment.Id == Assignment.Id && p.Person == user);
+    allow read when OverseesAssignments || ErasesAssignments;
+    allow create, update, delete when IsAuthenticated;
+    deny create except via SeatParticipant;
+    deny update Role, Acts except via SeatParticipant;
+    deny delete except via RemoveParticipant, TakePersonOffAssignment;
+  }
+}
+
+// ── asking for work ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// What an assignment is opened with.
+public class NewAssignment {
+  public string Title = "";
+  /// The outcome wanted, in words.
+  public string Goal = "";
+  public string Scope = "";
+  /// What must be true for it to be done — one sentence each. More can be added while it is open (`AddCriterion`).
+  public List<string> Criteria = [];
+  /// Who is accountable for it. Null: whoever asks.
+  public Principal? Owner;
+  /// Who does the work — people, or agents' own accounts (`Agents.Of<X>().Actor`).
+  public List<Principal> Assignees = [];
+  public DateTime? DueAt;
+  /// How long it may go without meaningful progress before it is stalled. Null: the app's `StalledAfter`.
+  public TimeSpan? StalledAfter;
+  /// How many lines its activity has: each line's place in it.
+  int Lines = 0;
+
+  /// The most it may spend on models, in US dollars. Null: counted, and not limited.
+  public decimal? Budget;
+  /// The assignment it is opened under.
+  public Assignment? Parent;
+  /// When opened under another: the criterion this one's completion meets ON THAT ONE — "The Nordic orders are
+  /// covered". "": the parent gains no criterion.
+  public string ParentCriterion = "";
+  /// The process it follows, and that process's version, as the app names them.
+  public string Process = "";
+  public string ProcessVersion = "";
+}
+
+/// ⭐ ASK FOR A PIECE OF WORK. Whoever is signed in is who asked; a process that opens one asks for the app itself
+/// and names an owner.
+[Server, Authorize(IsAuthenticated)]
+public Assignment OpenAssignment(NewAssignment ask) {
+  if (ask.Title.Trim() == "") { throw new ValidationException("An assignment needs a title."); }
+  if (ask.Goal.Trim() == "") { throw new ValidationException("An assignment says the outcome that is wanted: its `Goal`."); }
+  var me = Me();
+  var requester = me ?? ask.Owner;
+  if (requester == null) {
+    throw new ValidationException("Nobody is signed in, so the assignment needs an `Owner`: the person accountable for it.");
+  }
+  var parent = ask.Parent;
+  var setup = App.Setting<AssignmentsSetup>();
+  if (parent != null) {
+    if (parent.State != AssignmentState.Open) {
+      throw new AssignmentClosed($"“{parent.Title}” is {StateWords(parent.State)}; nothing is opened under it.");
+    }
+    if (parent.Depth + 1 > setup.MaxDepth) {
+      throw new ValidationException($"Assignments nest {setup.MaxDepth} deep at most.");
+    }
+  }
+  var a = new Assignment {
+    Title = ask.Title.Trim(), Goal = ask.Goal.Trim(), Scope = ask.Scope.Trim(),
+    Requester = requester!, Owner = ask.Owner,
+    Parent = parent, Root = parent == null ? null : (parent.Root ?? parent), Depth = parent == null ? 0 : parent.Depth + 1,
+    Process = ask.Process, ProcessVersion = ask.ProcessVersion,
+    DueAt = ask.DueAt,
+    StalledAfterMinutes = ask.StalledAfter == null ? 0 : (int)Math.Round(ask.StalledAfter!.TotalMinutes),
+    BudgetMicros = ask.Budget == null ? 0 : AssignmentMicros(ask.Budget!),
+  };
+  SeatParticipant(a, requester!, ParticipantRole.Requester);
+  if (ask.Owner != null) { SeatParticipant(a, ask.Owner!, ParticipantRole.Owner); }
+  foreach (var who in ask.Assignees) { SeatParticipant(a, who, ParticipantRole.Assignee); }
+  // Whoever is on the assignment above is on this one, to read it.
+  if (parent != null) {
+    foreach (var above in parent.Participants.ToList()) { SeatParticipant(a, above.Person, ParticipantRole.Above); }
+  }
+  var position = 0;
+  foreach (var text in ask.Criteria) {
+    if (text.Trim() == "") { continue; }
+    position = position + 1;
+    new AssignmentCriterion { Assignment = a, Position = position, Text = text.Trim() };
+  }
+  RecordActivity(a, new ActivityNote { Kind = ActivityKind.Opened, Said = "Opened: " + a.Goal, Progress = true });
+  if (parent != null) {
+    if (ask.ParentCriterion.Trim() != "") { AddCriterion(parent, ask.ParentCriterion.Trim(), metWhen: a); }
+    RecordActivity(parent, new ActivityNote { Kind = ActivityKind.Linked, Said = $"Opened under it: “{a.Title}”.", Reference = a.Id, ReferenceType = "Assignment" });
+  }
+  Raise(new AssignmentOpened { Assignment = a });
+  return a;
+}
+
+/// Put somebody on an assignment: an assignee who does the work, a contributor who adds to it, an observer who
+/// follows it. Whoever asked, whoever owns it and whoever oversees assignments may; the same call changes what
+/// somebody already on it is.
+[Server]
+public void AddParticipant(Assignment a, Principal person, ParticipantRole role = ParticipantRole.Contributor) {
+  RequireOpen(a);
+  RequireInCharge(a, "put somebody on it");
+  if (role == ParticipantRole.Requester || role == ParticipantRole.Above) {
+    throw new ValidationException("Somebody is put on an assignment as its owner, an assignee, a contributor or an observer.");
+  }
+  if (role == ParticipantRole.Owner) { SetAssignmentOwner(a, person); return; }
+  SeatParticipant(a, person, role);
+  SeatBelow(a, person);
+  RecordActivity(a, new ActivityNote { Kind = ActivityKind.ParticipantAdded, Said = $"{NameOf(person)} is on it as {RoleWords(role)}." });
+}
+
+/// Take somebody off an assignment. Whoever asked and whoever owns it stay on it.
+[Server, Authorize(IsAuthenticated)]
+public void RemoveParticipant(Assignment a, Principal person) {
+  RequireInCharge(a, "take somebody off it");
+  var seat = a.Participants.FirstOrDefault(p => p.Person == person);
+  if (seat == null) { return; }
+  if (seat.Role == ParticipantRole.Requester || seat.Role == ParticipantRole.Owner) {
+    throw new ValidationException($"{NameOf(person)} is its {RoleWords(seat.Role)}, and stays on it.");
+  }
+  seat.Delete();
+  RecordActivity(a, new ActivityNote { Kind = ActivityKind.ParticipantRemoved, Said = $"{NameOf(person)} is no longer on it." });
+}
+
+/// Name who is accountable for it. Whoever asked, whoever owns it now and whoever oversees assignments may.
+[Server, Authorize(IsAuthenticated)]
+public void SetAssignmentOwner(Assignment a, Principal owner) {
+  RequireOpen(a);
+  RequireInCharge(a, "name its owner");
+  var before = a.Owner;
+  a.Owner = owner;
+  // Whoever owned it before stays on it, as a contributor.
+  if (before != null && before != owner) { SeatParticipant(a, before!, ParticipantRole.Contributor, stepDown: true); }
+  SeatParticipant(a, owner, ParticipantRole.Owner);
+  SeatBelow(a, owner);
+  RecordActivity(a, new ActivityNote { Kind = ActivityKind.ParticipantAdded, Said = $"{NameOf(owner)} owns it." });
+}
+
+/// Move the date the outcome is wanted by — recorded with the date it was, the date it is and why.
+[Server, Authorize(IsAuthenticated)]
+public void MoveAssignmentDeadline(Assignment a, DateTime? dueAt, string why) {
+  RequireOpen(a);
+  RequireInCharge(a, "move its date");
+  if (why.Trim() == "") { throw new ValidationException("Say why the date moves: it is kept with the assignment."); }
+  var was = a.DueAt;
+  a.DueAt = dueAt;
+  RecordActivity(a, new ActivityNote {
+    Kind = ActivityKind.DeadlineMoved,
+    Said = $"Wanted by {WhenWords(dueAt)} (it was {WhenWords(was)}): {why.Trim()}",
+  });
+}
+
+/// How long it may go without meaningful progress before it is stalled.
+[Server, Authorize(IsAuthenticated)]
+public void SetStalledAfter(Assignment a, TimeSpan after) {
+  RequireOpen(a);
+  RequireInCharge(a, "change when it counts as stalled");
+  a.StalledAfterMinutes = (int)Math.Round(after.TotalMinutes);
+}
+
+/// The most it may spend on models, in US dollars. Null: counted, and not limited.
+[Server, Authorize(IsAuthenticated)]
+public void SetAssignmentBudget(Assignment a, decimal? budget) {
+  RequireOpen(a);
+  RequireInCharge(a, "set its budget");
+  a.BudgetMicros = budget == null ? 0 : AssignmentMicros(budget!);
+  RecordActivity(a, new ActivityNote {
+    Kind = ActivityKind.Note,
+    Said = budget == null ? "Its budget was lifted." : $"Its budget is ${budget}.",
+  });
+}
+
+// ── who is asking ───────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Whoever is signed in — or acting, when an actor's block is running. Null: the app itself (a process, a handler).
+Principal? Me() {
+  var me = Security.CurrentUserId;
+  return me == null ? null : Principal.FirstOrDefault(p => p.Id == me);
+}
+
+/// Whether the caller oversees assignments. The app itself does.
+bool IOversee() {
+  var me = Me();
+  if (me == null) { return Security.CurrentUserId == null; }
+  return Security.Authorize(me!, OverseesAssignments);
+}
+
+/// Whether whoever is calling is in charge of `a`: they asked for it, they own it, or they oversee assignments.
+/// What a package built on assignments asks before it lets somebody decide for one.
+public bool InChargeOf(Assignment a) {
+  var me = Security.CurrentUserId;
+  if (me == null) { return true; }
+  return (a.Requester != null && a.Requester!.Id == me) || (a.Owner != null && a.Owner!.Id == me) || IOversee();
+}
+
+/// Whoever asked, whoever owns it, and whoever oversees assignments are in charge of one.
+void RequireInCharge(Assignment a, string what) {
+  var me = Security.CurrentUserId;
+  if (me == null) { return; }
+  if ((a.Requester != null && a.Requester!.Id == me) || (a.Owner != null && a.Owner!.Id == me) || IOversee()) { return; }
+  throw new NotAuthorized($"Only whoever asked for “{a.Title}”, whoever owns it or somebody who oversees assignments may {what}.");
+}
+
+void RequireOpen(Assignment a) {
+  if (a.State != AssignmentState.Open) {
+    throw new AssignmentClosed($"“{a.Title}” is {StateWords(a.State)}. Reopen it to work on it again.");
+  }
+}
+
+/// Put `person` on `a` as `role` — or raise what they already are to it. Whoever asked stays the requester, and an
+/// owner stays the owner unless they step down.
+[Server, Authorize(IsAuthenticated)]
+internal void SeatParticipant(Assignment a, Principal person, ParticipantRole role, bool stepDown = false) {
+  var acts = role != ParticipantRole.Observer && role != ParticipantRole.Above;
+  var seat = AssignmentParticipant.FirstOrDefault(p => p.Assignment == a && p.Person == person);
+  if (seat == null) { new AssignmentParticipant { Assignment = a, Person = person, Role = role, Acts = acts }; return; }
+  if (seat.Role == ParticipantRole.Requester) { return; }
+  if (seat.Role == ParticipantRole.Owner && !stepDown) { return; }
+  if (role == ParticipantRole.Above) { return; }
+  seat.Role = role;
+  seat.Acts = acts;
+}
+
+/// Whoever is put on an assignment is on everything opened under it, to read it.
+void SeatBelow(Assignment a, Principal person) {
+  foreach (var child in a.Children.ToList()) {
+    SeatParticipant(child, person, ParticipantRole.Above);
+    SeatBelow(child, person);
+  }
+}
+
+// ── words ───────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// A person as they are named in a sentence.
+public string NameOf(Principal? person) {
+  if (person == null) { return "The app"; }
+  return person!.DisplayName != "" ? person!.DisplayName : person!.Email;
+}
+
+string StateWords(AssignmentState state) {
+  return state == AssignmentState.Open ? "open"
+       : state == AssignmentState.Completed ? "completed"
+       : state == AssignmentState.CompletedByException ? "completed by exception"
+       : state == AssignmentState.Cancelled ? "cancelled" : "failed";
+}
+
+string RoleWords(ParticipantRole role) {
+  return role == ParticipantRole.Requester ? "requester" : role == ParticipantRole.Owner ? "owner"
+       : role == ParticipantRole.Assignee ? "an assignee" : role == ParticipantRole.Contributor ? "a contributor"
+       : role == ParticipantRole.Observer ? "an observer" : "somebody from the assignment above";
+}
+
+string WhenWords(DateTime? at) { return at == null ? "no date" : $"{at!:d MMM yyyy HH:mm} UTC"; }
+
+/// US dollars as millionths of one.
+long AssignmentMicros(decimal dollars) { return (long)Math.Round(dollars * 1000000m); }
+
+string Clip(string text, int max) { return text.Length <= max ? text : text.Substring(0, max); }
