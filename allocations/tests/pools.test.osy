@@ -1,0 +1,201 @@
+// Osysharp.Assignments.Allocations — a pool three jobs draw on: what is held, what is refused, what waits its turn,
+// what happens when there is less than was thought, and who may do which of those.
+using Osysharp.Identity;
+using Osysharp.Assignments;
+using Osysharp.Assignments.Allocations;
+using Pumpworks;
+
+[Test(Plant)]
+void a_claim_is_held_and_one_that_does_not_fit_is_refused_saying_who_holds_the_rest() {
+  var jobs = ThreeJobsAndAPool();
+  runas (Bram) {
+    var held = Claim(Stock(), JobBy(jobs[0]), 80, "Nordic orders due this month", key: "stock");
+    Assert.Equal(AllocationState.Held, held.State);
+    Assert.Equal(80, Stock().Held);
+    Assert.Equal(40, LeftIn(Stock()));
+    // It is said on the job, where whoever follows the job reads it.
+    Assert.True(ActivityOf(JobBy(jobs[0]), 20).Any(l => l.Said == "Holds 80 housings of Housings in the Malmö warehouse: Nordic orders due this month"));
+  }
+  runas (Clara) {
+    var refused = Assert.Throws<NotEnoughLeft>(() => Claim(Stock(), JobBy(jobs[1]), 60, "DACH orders due this month", key: "stock"));
+    Assert.Equal("40 housings of Housings in the Malmö warehouse are left, and “DACH” asked for 60 housings. Held: 80 housings for Nordic orders due this month.", refused.Message);
+    Assert.Equal(40, refused.Left);
+    // Nothing was taken by the claim that was refused.
+    Assert.Equal(80, Stock().Held);
+    Assert.Equal(0, Allocation.Count(c => c.Assignment.Id == jobs[1]));
+    // She sees the pool, and what each share of it is for — not the other job, which is not hers to read.
+    var view = PoolOf(Stock().Id);
+    Assert.Equal(["Nordic orders due this month"], view.Holding.Select(l => l.Why).ToList());
+    Assert.Equal([""], view.Holding.Select(l => l.AssignmentTitle).ToList());
+    Assert.Equal(0, Assignment.Count(a => a.Id == jobs[0]));
+    // What is left can be had.
+    Claim(Stock(), JobBy(jobs[1]), 40, "DACH orders due this month", key: "stock");
+    Assert.Equal(0, LeftIn(Stock()));
+  }
+}
+
+[Test(Plant)]
+void a_claim_made_again_under_the_same_key_is_the_claim_already_made() {
+  var jobs = ThreeJobsAndAPool();
+  runas (Bram) {
+    var first = Claim(Stock(), JobBy(jobs[0]), 80, "Nordic orders due this month", key: "stock");
+    var again = Claim(Stock(), JobBy(jobs[0]), 80, "Nordic orders due this month", key: "stock");
+    Assert.Equal(first.Id, again.Id);
+    Assert.Equal(80, Stock().Held);
+    Assert.Equal(1, Allocation.Count());
+  }
+}
+
+[Test(Plant)]
+void a_claim_that_does_not_fit_can_wait_and_is_served_in_the_order_it_asked() {
+  var jobs = ThreeJobsAndAPool();
+  runas (Bram) { Claim(Stock(), JobBy(jobs[0]), 100, "Nordic orders due this month", key: "stock"); }
+  // DACH asks for 60 and waits; UK asks for 20 — which WOULD fit — and waits behind it: nobody jumps the queue.
+  runas (Clara) {
+    var waiting = AskFor(Stock(), JobBy(jobs[1]), 60, "DACH orders due this month", key: "stock");
+    Assert.Equal(AllocationState.Waiting, waiting.State);
+    // The job says what it waits for, as a piece of its work that cannot move.
+    var work = WorkOf(JobBy(jobs[1]), WaitingWorkKey(waiting))!;
+    Assert.Equal("Wait for 60 housings of Housings in the Malmö warehouse", work.Title);
+    Assert.True(work.Blocked);
+    Assert.Equal("20 housings left. Held: 100 housings for Nordic orders due this month.", work.BlockedWhy);
+  }
+  runas (Deniz) { Assert.Equal(AllocationState.Waiting, AskFor(Stock(), JobBy(jobs[2]), 20, "UK orders due this month", key: "stock").State); }
+  runas (Astrid) { Assert.Equal(100, Stock().Held); }
+
+  // Nordics gives 50 back: DACH, who asked first, is served; UK — 10 are left — still waits.
+  runas (Bram) {
+    ReleaseAllocation(ClaimOf(jobs[0]), "Half the orders moved to June.");
+    Claim(Stock(), JobBy(jobs[0]), 50, "Orders still due this month", key: "stock-2");
+  }
+  Background.Settle();
+  runas (Astrid) {
+    Assert.Equal(AllocationState.Released, ClaimOf(jobs[0]).State);
+    Assert.Equal(AllocationState.Held, ClaimOf(jobs[1]).State);
+    Assert.Equal(AllocationState.Waiting, ClaimOf(jobs[2]).State);
+    Assert.Equal(110, Stock().Held);
+    var work = WorkOf(JobBy(jobs[1]), WaitingWorkKey(ClaimOf(jobs[1])))!;
+    Assert.Equal(WorkState.Done, work.State);
+    Assert.True(ActivityOf(JobBy(jobs[1]), 20).Any(l => l.Said == "Holds 60 housings of Housings in the Malmö warehouse, after waiting for it."));
+  }
+}
+
+[Test(Plant)]
+void a_job_that_is_closed_holds_nothing_and_whoever_waited_is_served() {
+  var jobs = ThreeJobsAndAPool();
+  runas (Bram) { Claim(Stock(), JobBy(jobs[0]), 100, "Nordic orders due this month", key: "stock"); }
+  runas (Clara) { AskFor(Stock(), JobBy(jobs[1]), 60, "DACH orders due this month", key: "stock"); }
+  runas (Deniz) { AskFor(Stock(), JobBy(jobs[2]), 30, "UK orders due this month", key: "stock"); }
+
+  // The Nordic job is called off: what it held goes back, and both who waited are served, in turn.
+  runas (Bram) { CancelAssignment(JobBy(jobs[0]), "The Nordic customers took another pump."); }
+  Background.Settle();
+  runas (Astrid) {
+    Assert.Equal(AllocationState.Released, ClaimOf(jobs[0]).State);
+    Assert.Equal("The assignment was called off: The Nordic customers took another pump.", ClaimOf(jobs[0]).Note);
+    Assert.Equal(AllocationState.Held, ClaimOf(jobs[1]).State);
+    Assert.Equal(AllocationState.Held, ClaimOf(jobs[2]).State);
+    Assert.Equal(90, Stock().Held);
+  }
+  // A job that was waiting and is called off waits no more, and a closed job claims nothing.
+  runas (Deniz) {
+    CancelAssignment(JobBy(jobs[2]), "The UK customers agreed to wait.");
+    Assert.Throws<AssignmentClosed>(() => Claim(Stock(), JobBy(jobs[2]), 5, "More", key: "late"));
+  }
+  Background.Settle();
+  runas (Astrid) {
+    Assert.Equal(AllocationState.Released, ClaimOf(jobs[2]).State);
+    Assert.Equal(60, Stock().Held);
+  }
+}
+
+[Test(Plant)]
+void less_than_was_thought_overdraws_the_pool_and_its_keeper_decides_who_gives_way() {
+  var jobs = ThreeJobsAndAPool();
+  runas (Bram) { Claim(Stock(), JobBy(jobs[0]), 80, "Nordic orders due this month", key: "stock"); }
+  runas (Clara) { Claim(Stock(), JobBy(jobs[1]), 40, "DACH orders due this month", key: "stock"); }
+  runas (Deniz) { AskFor(Stock(), JobBy(jobs[2]), 30, "UK orders due this month", key: "stock"); }
+
+  // A count finds 30 damaged. Nothing is taken from anybody: the pool is overdrawn, and every holder is told.
+  runas (Astrid) {
+    CorrectPool(Stock(), 90, "The count found 30 housings damaged by damp.");
+    var view = PoolOf(Stock().Id);
+    Assert.True(view.Overdrawn);
+    Assert.Equal("30 housings", view.OverdrawnBy);
+    Assert.Equal("90 housings", view.Available);
+    Assert.Equal("120 housings", view.Held);
+    Assert.Equal("0 housings", view.Left);
+    Assert.Equal(["Nordics", "DACH"], view.Holding.Select(l => l.AssignmentTitle).ToList());
+    Assert.True(view.Holding.All(l => l.InQuestion));
+    Assert.Equal(["UK"], view.Waiting.Select(l => l.AssignmentTitle).ToList());
+  }
+  runas (Bram) {
+    Assert.True(ActivityOf(JobBy(jobs[0]), 20).Any(l => l.Said == "Housings in the Malmö warehouse: 90 housings now, 120 housings before — The count found 30 housings damaged by damp. 120 housings is held, 30 housings too many. This assignment's 80 housings is in question until it is decided who gives way."));
+    // A share that is in question cannot be used.
+    var refused = Assert.Throws<ValidationException>(() => UseAllocation(ClaimOf(jobs[0]), "Shipped"));
+    Assert.Equal("Housings in the Malmö warehouse is overdrawn, and this share of it has not been decided: it cannot be used yet.", refused.Message);
+  }
+
+  // The keeper decides: the Nordics give way by 30. Nobody's share is in question any more.
+  runas (Astrid) {
+    CutAllocation(ClaimOf(jobs[0]), 50, "Nordic orders 14 to 19 can ship in June.");
+  }
+  Background.Settle();
+  runas (Astrid) {
+    var view = PoolOf(Stock().Id);
+    Assert.False(view.Overdrawn);
+    Assert.Equal("90 housings", view.Held);
+    Assert.False(view.Holding.Any(l => l.InQuestion));
+    // Whoever waits is not served by a cut that only made the pool whole.
+    Assert.Equal(AllocationState.Waiting, ClaimOf(jobs[2]).State);
+  }
+  runas (Bram) {
+    Assert.Equal(50, ClaimOf(jobs[0]).Amount);
+    Assert.Equal(80, ClaimOf(jobs[0]).Asked);
+    Assert.True(ActivityOf(JobBy(jobs[0]), 20).Any(l => l.Said == "Holds 50 housings of Housings in the Malmö warehouse, down from 80 housings: Nordic orders 14 to 19 can ship in June."));
+    // What it still holds can be used again — and what is used is gone from the pool for good.
+    UseAllocation(ClaimOf(jobs[0]), "Shipped on 16 May.");
+  }
+  runas (Astrid) {
+    Assert.Equal(AllocationState.Used, ClaimOf(jobs[0]).State);
+    Assert.Equal(40, Stock().Available);
+    Assert.Equal(40, Stock().Held);
+    // A delivery arrives: there is room, and who waited is served.
+    CorrectPool(Stock(), 70, "30 housings arrived from Ferrol Foundry.");
+  }
+  Background.Settle();
+  runas (Astrid) {
+    Assert.Equal(AllocationState.Held, ClaimOf(jobs[2]).State);
+    Assert.Equal(70, Stock().Held);
+  }
+}
+
+[Test(Plant)]
+void each_person_does_what_is_theirs_with_a_pool_and_nothing_else() {
+  var jobs = ThreeJobsAndAPool();
+  runas (Bram) { Claim(Stock(), JobBy(jobs[0]), 80, "Nordic orders due this month", key: "stock"); }
+  // A region's lead claims for the job they act on — not for one they only follow.
+  runas (Bram) { AddParticipant(JobBy(jobs[0]), Clara, ParticipantRole.Observer); }
+  runas (Clara) { Assert.Denied(() => Claim(Stock(), JobBy(jobs[0]), 10, "For the Nordics", key: "mine")); }
+  // A lead does not say what there is, and does not decide who gives way.
+  runas (Bram) {
+    Assert.Throws<NotAuthorized>(() => CorrectPool(Stock(), 500, "I counted again."));
+    Assert.Throws<NotAuthorized>(() => OpenPool(new NewPool { Key = "mine", Title = "Mine", Available = 10 }));
+  }
+  runas (Clara) { Assert.Throws<NotAuthorized>(() => CutAllocation(ClaimOf(jobs[0]), 10, "DACH needs them more.")); }
+  // Nobody writes the pool's numbers by hand — the keeper included.
+  runas (Astrid) {
+    var stock = Stock();
+    Assert.Denied(() => { stock.Held = 0; UnitOfWork.Commit(); });
+    UnitOfWork.Discard();
+    Assert.Denied(() => { var c = ClaimOf(jobs[0]); c.Amount = 500; UnitOfWork.Commit(); });
+    UnitOfWork.Discard();
+    Assert.Equal(80, Stock().Held);
+  }
+  // Somebody who neither keeps nor claims from the pools reads none of it.
+  runas (Ebba) {
+    Assert.Equal(0, SharedPool.Count());
+    Assert.Equal(0, Allocation.Count());
+    Assert.Equal("There is no pool called “malmo-housings”.", Assert.Throws<ValidationException>(() => PoolBy("malmo-housings")).Message);
+  }
+}

@@ -1,0 +1,642 @@
+// Halden Pumps: its people, a disruption and the regions it puts at risk, the agents that assess and plan, and the
+// process that carries the response from the first report to every commitment fulfilled or resolved.
+namespace Pumpworks;
+
+using Osysharp.Identity;
+using Osysharp.Organizations;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Assignments;
+using Osysharp.Assignments.Allocations;
+using Osysharp.Assignments.WorkQueues;
+using Osysharp.Assignments.Agents;
+using Osysharp.WorkRepositories;
+using Osysharp.WorkRepositories.Agents;
+using Osysharp.Agents;
+using Osysharp.Agents.HumanRequests;
+using Osysharp.Llm;
+using Osysharp.Workflow;
+using Osysharp.Processes;
+using Osysharp.ServiceHours;
+
+[Role] enum PlantRole { Authenticator, Operations, RegionLead, Procurement, Coordinating, Planning, Analysing }
+
+partial entity RoleGrant { security { allow read when IsAuthenticated; } }
+
+policy IsOperations   => RoleGrant.Any(g => g.Member == user && g.Role == PlantRole.Operations);
+policy IsRegionLead   => RoleGrant.Any(g => g.Member == user && g.Role == PlantRole.RegionLead);
+policy IsProcurement  => RoleGrant.Any(g => g.Member == user && g.Role == PlantRole.Procurement);
+policy IsCoordinating => RoleGrant.Any(g => g.Member == user && g.Role == PlantRole.Coordinating);
+policy IsPlanning     => RoleGrant.Any(g => g.Member == user && g.Role == PlantRole.Planning);
+policy IsAnalysing    => RoleGrant.Any(g => g.Member == user && g.Role == PlantRole.Analysing);
+policy IsAnAgent      => IsCoordinating || IsPlanning || IsAnalysing;
+policy IsStaff        => IsOperations || IsRegionLead || IsProcurement;
+
+policy WorksInbox       => IsStaff || IsAnAgent;
+policy LeadsInbox       => IsOperations;
+policy AdministersInbox => IsOperations;
+policy ManagesOrganizations  => IsOperations;
+policy CollaboratesOnRecords => IsStaff;
+// The planner's own account asks the foundry outside, for the region it plans.
+policy AsksPeople       => IsStaff || IsPlanning;
+policy OverseesRequests => IsOperations;
+// The response is a job, with a job under it for each region. The operations director opens and oversees them.
+policy OpensAssignments            => IsOperations;
+policy OverseesAssignments         => IsOperations;
+policy AcceptsAssignmentExceptions => IsOperations;
+policy ManagesWorkRepositories     => IsOperations;
+// The shared stock: the operations director keeps it — says what there is, and decides who gives way. The region
+// leads, and the planner's own account working for them, claim from it.
+policy KeepsSharedPools      => IsOperations;
+policy ClaimsFromSharedPools => IsOperations || IsRegionLead || IsPlanning;
+policy UsesAgents        => IsStaff;
+policy SupervisesAgents  => IsOperations;
+policy AuditsAgents      => IsOperations;
+policy ReadsModelUsage   => IsOperations;
+policy ManagesModelSpend => IsOperations;
+policy FollowsProcesses  => IsOperations || IsRegionLead;
+
+/// Somebody at the plant — and the agents' own accounts. A supplier outside has none.
+entity Person : Principal {
+  [MaxLength(200)] string CodeHash = "";
+  security {
+    allow read when IsAuthenticated || IsAuthenticator;
+    allow create when IsAuthenticator;
+    deny read CodeHash when !IsAuthenticator;
+  }
+}
+
+partial entity ServiceHours { security { allow read when IsStaff; allow create, update, delete when IsOperations; } }
+partial entity ServiceWindow { security { allow read when IsStaff; allow create, update, delete when IsOperations; } }
+partial entity ServiceException { security { allow read when IsStaff; allow create, update, delete when IsOperations; } }
+partial entity WorkItem { security { allow read when IsStaff || IsAnAgent; } }
+
+public enum ResponseStage {
+  [Label("Assessing what is at risk")] Assessing,
+  [Label("Planning each region")] Planning,
+  [Label("Deciding the plan")] Deciding,
+  [Label("Carrying it out")] Executing,
+  [Label("Planning again")] Replanning,
+  [Label("Closing the response")] Wrapping,
+  Resolved,
+  [Label("Stood down")] StoodDown,
+}
+
+/// ⭐ A DISRUPTION — something that puts what the plant promised its customers at risk. Behind it is the job: an
+/// assignment owned until every affected commitment is fulfilled or resolved.
+entity Disruption {
+  [Required, MaxLength(200)] string Title;
+  [MaxLength(600)] string Report = "";
+  [Required] Person Director;
+  [Required] Assignment Job;
+  /// The stock every region draws on.
+  [Required] SharedPool Stock;
+  ResponseStage Stage = ResponseStage.Assessing;
+  /// How many times it has planned again.
+  int Replans = 0;
+  [MaxLength(400)] string Note = "";
+  security { allow read, create, update when IsStaff || IsAnAgent; }
+}
+
+/// One sales region the disruption touches: what it needs, and how its plan covers that.
+entity SalesRegion {
+  [Required] Disruption Disruption;
+  [Required, MaxLength(80)] string Name;
+  [Required] Person Lead;
+  /// Its place among the regions: the order they plan in, and so who is served first from what is shared.
+  int Rank = 0;
+  /// The orders at risk, as the order book says it.
+  [MaxLength(400)] string OrderBook = "";
+  /// The job for this region, once the response has opened it.
+  Assignment? Job;
+  /// How many housings its orders this month need. 0: not assessed yet.
+  int Need = 0;
+  /// How its plan covers the need: from the shared stock, from the foundry outside, by waiting, by moving orders.
+  int FromStock = 0;
+  int FromFoundry = 0;
+  int Waiting = 0;
+  int Deferred = 0;
+  /// Its share of the stock was cut, and its plan no longer covers what it needs.
+  bool NeedsReplan = false;
+  bool Settled = false;
+  security { allow read, create, update when IsStaff || IsAnAgent; }
+}
+
+// ── what people are asked for ───────────────────────────────────────────────────────────────────────────────────────
+
+/// What a region's lead is asked when no agent could work it out.
+public class RegionNeed {
+  /// How many housings your region's orders need this month.
+  public int Housings;
+}
+
+/// What the foundry is asked through its link.
+public class FoundryOffer {
+  /// Can you deliver them by the date?
+  public bool CanDeliver;
+  /// The price for each, in euros.
+  public decimal PriceEach;
+}
+
+// ── what the agents can do ──────────────────────────────────────────────────────────────────────────────────────────
+
+/// How many housings there are in the warehouse.
+[Action("Read the stock", Query)]
+public string StockOnHand(Disruption disruption) {
+  return Amount(disruption.Stock, disruption.Stock.Available) + " in " + disruption.Stock.Title + ".";
+}
+
+/// The orders of one region that the disruption puts at risk.
+[Action("Read the order book", Query)]
+public string OrdersAtRisk(SalesRegion region) { return region.OrderBook; }
+
+/// Record how many housings a region's orders need this month.
+[Action("Record what a region needs")]
+public string RecordNeed(SalesRegion region, int housings) {
+  region.Need = housings;
+  return $"{region.Name} needs {housings}.";
+}
+
+/// Reserve housings from the shared stock for a region. Refused when that many are not left.
+[Action("Reserve stock")]
+public string ReserveStock(SalesRegion region, int housings) {
+  var held = Claim(region.Disruption.Stock, region.Job!, housings, $"{region.Name} orders due this month", key: "stock");
+  region.FromStock = (int)held.Amount;
+  return $"{Amount(held.Pool, held.Amount)} are held for {region.Name}.";
+}
+
+/// Ask for housings from the shared stock and wait for them, when they are not left now.
+[Action("Wait for stock")]
+public string WaitForStock(SalesRegion region, int housings) {
+  var claim = AskFor(region.Disruption.Stock, region.Job!, housings, $"{region.Name} orders due this month", key: "stock");
+  if (claim.State == AllocationState.Held) { region.FromStock = housings; return $"{housings} are held for {region.Name}."; }
+  region.Waiting = housings;
+  return $"{region.Name} waits its turn for {housings}.";
+}
+
+/// Ask the foundry outside whether it can deliver housings in time. It answers in its own time, through a link.
+[Action("Ask the foundry")]
+public string AskTheFoundry(SalesRegion region, int housings) {
+  var ask = NewRequest.For<FoundryOffer>();
+  ask.OutsideName = "Ferrol Foundry";
+  ask.OutsideEmail = "sales@ferrol.example";
+  ask.Title = $"Can you deliver {housings} H-40 housings by 23 May?";
+  ask.Context = "Halden Pumps needs them for orders in " + region.Name + ".";
+  ask.About = Subject.Of("SalesRegion", region.Id, region.Name);
+  ask.Within = TimeSpan.FromDays(3);
+  ask.ExpireAfter = TimeSpan.FromDays(10);
+  ask.AskedByName = "Disruption response";
+  AssignmentRequests.Ask(region.Job!, ask, key: "foundry");
+  region.FromFoundry = housings;
+  return $"Ferrol Foundry was asked for {housings}.";
+}
+
+/// Move some of a region's orders to next month, with the customers' agreement.
+[Action("Move orders to next month")]
+public string DeferOrders(SalesRegion region, int housings) {
+  region.Deferred = region.Deferred + housings;
+  AddItem(region.Job!, new NewItem { Kind = ItemKind.Decision, Key = "deferred-" + region.Disruption.Replans.ToString(), Title = $"{housings} housings' worth of orders moved to June",
+                                     Content = $"{region.Name}: orders needing {housings} housings are re-dated to June.",
+                                     Source = new ItemSource { From = "The region's revised plan, approved by " + region.Lead.DisplayName } });
+  return $"Orders needing {housings} are moved to June.";
+}
+
+string RegionNamed(string value) {
+  var r = SalesRegion.FirstOrDefault(x => x.Id == Guid.Parse(value));
+  return r == null ? value : r!.Name;
+}
+string DisruptionNamed(string value) {
+  var d = Disruption.FirstOrDefault(x => x.Id == Guid.Parse(value));
+  return d == null ? value : d!.Title;
+}
+string InTheirWords(string argument, string value) {
+  return argument == "region" ? RegionNamed(value) : argument == "disruption" ? DisruptionNamed(value) : argument == "housings" ? value + " housings" : value;
+}
+
+public class StockReading { public string Says = ""; }
+public class NeedReading { public int Housings; }
+/// What the coordinator hands back when it has looked at what is at risk.
+public class Assessment {
+  public string Stock = "";
+  /// The regions nobody could assess, by name.
+  public List<string> NotAssessed = [];
+}
+/// How a region's plan covers what it needs.
+public class RegionPlan {
+  public int FromStock;
+  public int FromFoundry;
+  public int Waiting;
+  public int Deferred;
+  public string Why = "";
+}
+
+public class ReadTheStock : Skill<Disruption, StockReading> {
+  public override string Description => "Read how much of the part is in stock.";
+  public override List<ActionInfo> Tools => [Actions.Of(StockOnHand)];
+  public override string Brief(Disruption d) => $"{d.Title}. The disruption's id is {d.Id}.";
+  public override string Names(string action, string argument, string value) => InTheirWords(argument, value);
+  public override string HandedSchema() => HandOn.ById("The disruption whose stock to read.");
+  public override Disruption Handed(string inputJson) { var id = HandOn.IdIn(inputJson); return Disruption.Single(d => d.Id == id); }
+}
+
+/// Works out what one region needs. A long order book is a long read, on a small allowance.
+public class AssessARegion : Skill<SalesRegion, NeedReading> {
+  public override string Description => "Work out how many housings one region's orders need this month, and record it.";
+  public override List<ActionInfo> Tools => [Actions.Of(OrdersAtRisk), Actions.Of(RecordNeed)];
+  public override string Brief(SalesRegion r) => $"The orders at risk in {r.Name}. The region's id is {r.Id}.";
+  public override string Names(string action, string argument, string value) => InTheirWords(argument, value);
+  public override string HandedSchema() => HandOn.ById("The region to assess.");
+  public override SalesRegion Handed(string inputJson) { var id = HandOn.IdIn(inputJson); return SalesRegion.Single(r => r.Id == id); }
+}
+
+public class AssessTheDisruption : Skill<Disruption, Assessment> {
+  public override string Description => "Assess the disruption: what is in stock, and what each region needs.";
+  public override string Brief(Disruption d) => $"{d.Title}. {d.Report} The disruption's id is {d.Id}.";
+}
+
+/// Plans how one region covers what it needs.
+public class PlanARegion : Skill<SalesRegion, RegionPlan> {
+  public override string Description => "Plan the recovery of one region: cover what its orders need from the shared stock, the foundry, or by waiting.";
+  public override List<ActionInfo> Tools => [Actions.Of(ReserveStock), Actions.Of(WaitForStock), Actions.Of(AskTheFoundry)];
+  public override string Brief(SalesRegion r) => $"{r.Name} needs {r.Need} housings this month. The region's id is {r.Id}.";
+  public override string Names(string action, string argument, string value) => InTheirWords(argument, value);
+}
+
+/// Plans again for a region whose share of the stock was cut.
+public class ReviseAPlan : Skill<SalesRegion, RegionPlan> {
+  public override string Description => "Plan again for a region that holds less of the shared stock than its plan counted on.";
+  public override List<ActionInfo> Tools => [Actions.Of(ListItems), Actions.Of(DeferOrders), Actions.Of(AskTheFoundry)];
+  public override string Brief(SalesRegion r) => $"{r.Name} needs {r.Need} housings and now holds {r.FromStock}. The region's id is {r.Id}; its job's id is {r.Job!.Id}.";
+  public override string Names(string action, string argument, string value) => InTheirWords(argument, value);
+}
+
+[Actor(Roles = [PlantRole.Analysing])]
+public class StockAnalyst : Agent {
+  public static Person Principal => new Person { Email = "stock-analyst@halden.example", DisplayName = "Stock analyst" };
+  public override string Purpose => "You read what is in the warehouse.";
+  public override List<SkillBase> Skills => [new ReadTheStock()];
+}
+
+[Actor(Roles = [PlantRole.Analysing])]
+public class ImpactAnalyst : Agent {
+  public static Person Principal => new Person { Email = "impact-analyst@halden.example", DisplayName = "Impact analyst" };
+  public override string Purpose => "You work out what a region's orders need.";
+  public override List<SkillBase> Skills => [new AssessARegion()];
+  public override Permits May => new Permits { Alone = [Actions.Of(RecordNeed)] };
+}
+
+/// ⭐ COORDINATES THE RESPONSE: has the stock read and each region assessed, a specialist each, all at once.
+[Actor(Roles = [PlantRole.Coordinating])]
+public class ResponseCoordinator : Agent {
+  public static Person Principal => new Person { Email = "response-coordinator@halden.example", DisplayName = "Response coordinator" };
+  public override string Purpose => "You coordinate the response to a disruption at a pump maker.";
+  public override List<SkillBase> Skills => [new AssessTheDisruption()];
+  public override Permits May => new Permits { Alone = [Actions.Of(RecordNeed)] };
+  public override Delegation Delegates => new Delegation {
+    To = [Specialist.Of<StockAnalyst>(new ReadTheStock(), budget: 0.006m), Specialist.Of<ImpactAnalyst>(new AssessARegion(), budget: 0.006m)],
+    MaxDepth = 1,
+  };
+}
+
+/// ⭐ PLANS A REGION'S RECOVERY. It may wait for stock and ask the foundry by itself; taking stock, and moving a
+/// customer's order, are proposed to the region's lead, every time.
+[Actor(Roles = [PlantRole.Planning])]
+public class RecoveryPlanner : Agent {
+  public static Person Principal => new Person { Email = "recovery-planner@halden.example", DisplayName = "Recovery planner" };
+  public override string Purpose => "You plan how a sales region keeps its promises when a part is short.";
+  public override List<SkillBase> Skills => [new PlanARegion(), new ReviseAPlan()];
+  public override Permits May => new Permits {
+    Alone = [Actions.Of(WaitForStock), Actions.Of(AskTheFoundry)],
+    ProposeEveryTime = [Actions.Of(ReserveStock), Actions.Of(DeferOrders)],
+  };
+}
+
+// ── the process ─────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// ⭐ THE RESPONSE TO ONE DISRUPTION, from the first report to every affected commitment fulfilled or resolved.
+workflow DisruptionResponse {
+  Tracks = Disruption.Stage; Autostart = false; Initial = Assessing;
+  /// A region's job ended — fulfilled, called off, or resolved by agreement.
+  event RegionSettled();
+  /// There is less of the shared stock than is held.
+  event StockChanged();
+  /// The director stands the response down.
+  event StandDown();
+
+  state Assessing {
+    enter {
+      var looked = await AssignedWork.Do(this.Item.Job, Agents.Of<ResponseCoordinator>().For(this.Item.Director), new AssessTheDisruption(), this.Item,
+                                         key: "assess", about: "What is at risk: " + this.Item.Title);
+      if (!looked.Done) { Processes.Problem("The coordinator could not assess the disruption: " + looked.Problem + " Each region's lead is asked instead."); }
+      OpenTheRegions(this.Item);
+      // A region no agent assessed is not a region nobody assesses: its lead is asked.
+      var asked = Workflow.Once("ask-the-leads", () => AskTheLeads(this.Item));
+      if (asked.Count > 0) { Processes.Problem(asked.Count.ToString() + " of the regions could not be assessed by the agents, so each one's lead is asked what it needs."); }
+      foreach (var request in asked) {
+        var answer = await Requests.Answer(HumanRequest.Single(r => r.Id == request));
+        KeepNeed(request, answer);
+      }
+      goto Planning;
+    }
+  }
+  state Planning {
+    enter {
+      // One region at a time, in the order the director ranked them: who plans first is served first.
+      foreach (var region in RegionsOf(this.Item.Id)) {
+        var plan = await AssignedWork.Do(RegionBy(region).Job!, Agents.Of<RecoveryPlanner>().For(RegionBy(region).Lead), new PlanARegion(), RegionBy(region),
+                                         key: "plan", about: "Recovery plan: " + RegionBy(region).Name);
+        KeepPlan(region, plan.Done, plan.Done ? plan.Result.Why : plan.Problem);
+      }
+      goto Deciding;
+    }
+  }
+  state Deciding {
+    enter {
+      var ask = Workflow.Once("decide", () => PutThePlan(this.Item));
+      var answer = await Requests.Answer(ask);
+      if (!answer.Approved) {
+        this.Item.Note = answer.Rejected ? "The director refused the plan: " + answer.Comment : "The plan was never decided: " + answer.ClosedWhy;
+        goto StoodDown;
+      }
+      PlanApproved(this.Item, ask);
+      goto Executing;
+    }
+  }
+  state Executing {
+    subscribe RegionSettled();
+    subscribe StockChanged();
+    enter { Processes.Waiting("The regions carry out their plans. Waiting for each to report."); }
+    on RegionSettled { if (EveryRegionIsSettled(this.Item.Id)) { goto Wrapping; } }
+    on StockChanged { goto Replanning; }
+  }
+  state Replanning {
+    enter {
+      BeginReplan(this.Item);
+      // Who gives way is a person's decision. The process asks, and plans again from what she decided.
+      var ask = Workflow.Once("who-gives-way", () => AskWhoGivesWay(this.Item));
+      var answer = await Requests.Answer(ask);
+      foreach (var region in RegionsToReplan(this.Item.Id)) {
+        var plan = await AssignedWork.Do(RegionBy(region).Job!, Agents.Of<RecoveryPlanner>().For(RegionBy(region).Lead), new ReviseAPlan(), RegionBy(region),
+                                         key: "revise-" + ReplanOf(this.Item.Id).ToString(), about: "Revised plan: " + RegionBy(region).Name);
+        KeepRevisedPlan(region, plan.Done, plan.Done ? plan.Result.Why : plan.Problem);
+      }
+      goto Executing;
+    }
+  }
+  state Wrapping {
+    enter {
+      CloseTheResponse(this.Item);
+      goto Resolved;
+    }
+  }
+  on StandDown { goto StoodDown; }
+
+  terminal success Resolved  { }
+  terminal cancel  StoodDown { Message = "the response was stood down"; }
+}
+
+/// A disruption response, for the people who follow it.
+public class DisruptionResponseProcess : Process<Disruption> {
+  public override string Name => "Disruption response";
+  public override string Workflow => "DisruptionResponse";
+  public override string Purpose => "From the first report to every affected commitment fulfilled or resolved.";
+  public override WorkflowGraph Graph => DisruptionResponse.Graph;
+  public override TimeSpan? StuckAfter => TimeSpan.FromDays(14);
+  public override string TitleOf(Disruption d) => d.Title;
+  public override List<WorkflowAuditEntry> HistoryOf(Disruption d) => DisruptionResponse.For(d).Audit;
+}
+
+// ── what the process does between its steps ─────────────────────────────────────────────────────────────────────────
+
+[Server, Authorize(IsAuthenticated), OwnUnitOfWork]
+internal List<Guid> RegionsOf(Guid disruption) { return SalesRegion.Where(r => r.Disruption.Id == disruption).OrderBy(r => r.Rank).ToList().Select(r => r.Id).ToList(); }
+[Server, Authorize(IsAuthenticated), OwnUnitOfWork]
+internal List<Guid> RegionsToReplan(Guid disruption) { return SalesRegion.Where(r => r.Disruption.Id == disruption && r.NeedsReplan && !r.Settled).OrderBy(r => r.Rank).ToList().Select(r => r.Id).ToList(); }
+[Server, Authorize(IsAuthenticated), OwnUnitOfWork]
+internal int ReplanOf(Guid disruption) { return Disruption.Single(d => d.Id == disruption).Replans; }
+[Server, Authorize(IsAuthenticated), OwnUnitOfWork]
+internal bool EveryRegionIsSettled(Guid disruption) { return !SalesRegion.Any(r => r.Disruption.Id == disruption && !r.Settled); }
+public SalesRegion RegionBy(Guid id) { return SalesRegion.Single(r => r.Id == id); }
+
+/// A job under the response for each region: its lead owns it, the planner works on it, and the response is not
+/// done until each is fulfilled or resolved.
+public void OpenTheRegions(Disruption d) {
+  foreach (var region in SalesRegion.Where(r => r.Disruption == d).OrderBy(r => r.Rank).ToList()) {
+    if (region.Job != null) { continue; }
+    var job = OpenAssignment(new NewAssignment {
+      Title = region.Name + ": keep this month's promises", Goal = "Every order in " + region.Name + " that needed the part is shipped, or re-dated with the customer's agreement.",
+      Parent = d.Job, ParentCriterion = region.Name + ": commitments fulfilled or resolved",
+      Owner = region.Lead, Assignees = [Agents.Of<RecoveryPlanner>().Actor], Budget = 0.05m,
+    });
+    AddCriterion(job, "The region's plan covers what its orders need", key: "plan");
+    AddCriterion(job, "The orders are shipped or re-dated", key: "fulfilled");
+    LinkAssignments(job, d.Job, Osysharp.Assignments.LinkKind.RelatedTo, "Draws on " + d.Stock.Title);
+    region.Job = job;
+  }
+}
+
+/// Ask the lead of every region nobody assessed what it needs. Answers the requests.
+public List<Guid> AskTheLeads(Disruption d) {
+  List<Guid> put = [];
+  foreach (var region in SalesRegion.Where(r => r.Disruption == d && r.Need == 0).OrderBy(r => r.Rank).ToList()) {
+    var ask = NewRequest.For<RegionNeed>();
+    ask.To = region.Lead;
+    ask.Title = "How many housings do " + region.Name + "'s orders need this month?";
+    ask.Context = "The agents could not work it out from the order book.";
+    ask.About = Subject.Of("SalesRegion", region.Id, region.Name);
+    ask.Within = TimeSpan.FromDays(1);
+    ask.AskedByName = "Disruption response";
+    put.Add(AssignmentRequests.Ask(region.Job!, ask, key: "need").Id);
+  }
+  return put;
+}
+
+public void KeepNeed(Guid request, RequestOutcome answer) {
+  var r = HumanRequest.Single(x => x.Id == request);
+  var region = SalesRegion.Single(x => x.Id == r.SubjectId);
+  if (answer.Answered) { region.Need = answer.As<RegionNeed>().Housings; }
+}
+
+/// What came of a region's planning: its first criterion is met when the plan covers the need.
+public void KeepPlan(Guid region, bool done, string why) {
+  var r = SalesRegion.Single(x => x.Id == region);
+  var covered = r.FromStock + r.FromFoundry + r.Waiting + r.Deferred;
+  if (done && covered >= r.Need) { MeetCriterion(CriterionOf(r.Job!, "plan"), $"{r.FromStock} from stock, {r.FromFoundry} from the foundry, {r.Waiting} waited for. {why}"); }
+  else { Processes.Problem($"{r.Name} has no plan that covers its {r.Need}: {why}"); }
+}
+
+public void KeepRevisedPlan(Guid region, bool done, string why) {
+  var r = SalesRegion.Single(x => x.Id == region);
+  var covered = r.FromStock + r.FromFoundry + r.Waiting + r.Deferred;
+  if (done && covered >= r.Need) {
+    r.NeedsReplan = false;
+    MeetCriterion(CriterionOf(r.Job!, "plan"), $"{r.FromStock} from stock, {r.Deferred} moved to June. {why}");
+  } else { Processes.Problem($"{r.Name} still has no plan that covers its {r.Need}: {why}"); }
+}
+
+/// The plan as a whole, put to the director as a yes or a no.
+public HumanRequest PutThePlan(Disruption d) {
+  List<RequestFact> facts = [];
+  foreach (var r in SalesRegion.Where(r => r.Disruption == d).OrderBy(r => r.Rank).ToList()) {
+    facts.Add(new RequestFact(r.Name, $"needs {r.Need}: {r.FromStock} from stock, {r.FromFoundry} from the foundry, {r.Waiting} waiting"));
+  }
+  return AssignmentRequests.Ask(d.Job, new NewRequest {
+    Kind = RequestKind.Approval, To = d.Director, Title = "Approve the recovery plan",
+    Context = "Each region's lead has approved their own part. This is the plan as a whole.",
+    Facts = facts, About = Subject.Of("Disruption", d.Id, d.Title, version: "plan 1"),
+    Within = TimeSpan.FromDays(1), AskedByName = "Disruption response",
+  }, key: "decide");
+}
+
+public void PlanApproved(Disruption d, HumanRequest ask) {
+  MeetCriterion(CriterionOf(d.Job, "plan"), "Approved by " + d.Director.DisplayName + ".", ask.Id, "HumanRequest");
+}
+
+public void BeginReplan(Disruption d) {
+  d.Replans = d.Replans + 1;
+}
+
+/// The stock is overdrawn: the director is asked who gives way. She decides on the pool; this is where she says so.
+public HumanRequest AskWhoGivesWay(Disruption d) {
+  var stock = d.Stock;
+  return AssignmentRequests.Ask(d.Job, new NewRequest {
+    Kind = RequestKind.Question, To = d.Director,
+    Title = stock.Title + ": more is held than there is. Who gives way?",
+    Context = $"{stock.LastChange} There " + (stock.Available == 1 ? "is " : "are ") + $"{Amount(stock, stock.Available)}; {Amount(stock, stock.Held)} is held. Cut a region's share on the stock's page, then say here what you decided.",
+    About = Subject.Of("Disruption", d.Id, d.Title, version: "replan " + d.Replans.ToString()),
+    Within = TimeSpan.FromDays(1), AskedByName = "Disruption response",
+  }, key: "who-gives-way-" + d.Replans.ToString());
+}
+
+/// Every region is settled: the response is done when what "done" means is — and says what it could not fulfil.
+public void CloseTheResponse(Disruption d) {
+  var job = Assignment.Single(a => a.Id == d.Job.Id);
+  var excepted = job.Criteria.Count(c => c.State == CriterionState.Excepted);
+  CompleteAssignment(job, "Every region's commitments are fulfilled or resolved.",
+                     limitations: excepted == 0 ? "" : excepted.ToString() + " region was resolved by agreement, not fulfilled.");
+}
+
+// ── what people do ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// The director reports a disruption: the job, the stock every region draws on, the regions, and the response.
+public Disruption ReportDisruption(string title, string report, string stockKey, string stockTitle, int onHand) {
+  var mine = Security.CurrentUserId;
+  var director = Person.Single(p => p.Id == mine);
+  var job = OpenAssignment(new NewAssignment {
+    Title = title, Goal = "Every customer commitment the disruption put at risk is fulfilled or resolved.",
+    Owner = director, Assignees = [Agents.Of<ResponseCoordinator>().Actor, Agents.Of<StockAnalyst>().Actor, Agents.Of<ImpactAnalyst>().Actor],
+    Budget = 0.20m, Process = "disruption-response", ProcessVersion = "1",
+  });
+  AddCriterion(job, "The recovery plan is approved", key: "plan");
+  AddItem(job, new NewItem { Kind = ItemKind.Input, Key = "report", Title = "The first report", Content = report, Source = new ItemSource { From = director.DisplayName } });
+  var stock = OpenPool(new NewPool { Key = stockKey, Title = stockTitle, Unit = "housings", Available = onHand });
+  var d = new Disruption { Title = title, Report = report, Director = director, Job = job, Stock = stock };
+  return d;
+}
+
+public SalesRegion AddRegion(Disruption d, string name, Person lead, string orderBook) {
+  return new SalesRegion { Disruption = d, Name = name, Lead = lead, OrderBook = orderBook, Rank = SalesRegion.Count(r => r.Disruption == d) + 1 };
+}
+
+public void BeginTheResponse(Disruption d) {
+  UnitOfWork.Commit();
+  Workflow.Run(d);
+}
+
+/// A region's lead reports the orders shipped: what it held is used, the report is evidence, and its job is done.
+public void RegionShipped(SalesRegion region, string report) {
+  var job = region.Job!;
+  var held = Allocation.FirstOrDefault(c => c.Assignment == job && c.State == AllocationState.Held);
+  if (held != null) { UseAllocation(held!, report); }
+  var evidence = AddItem(job, new NewItem { Kind = ItemKind.Evidence, Key = "shipped", Title = region.Name + ": shipped", Content = report,
+                                            Source = new ItemSource { From = Session.CurrentUser!.DisplayName } });
+  MeetWith(CriterionOf(job, "fulfilled"), evidence, "Reported by " + Session.CurrentUser!.DisplayName);
+  CompleteAssignment(job, report);
+  region.Settled = true;
+  UnitOfWork.Commit();
+  DisruptionResponse.RaiseRegionSettled(region.Disruption);
+}
+
+/// A region's work is no longer needed: its job is called off — and with it everything it held or waited for.
+public void CallOffRegion(SalesRegion region, string why) {
+  CancelAssignment(region.Job!, why);
+  region.Settled = true;
+  region.Waiting = 0;
+  UnitOfWork.Commit();
+}
+
+/// The director accepts, in writing, that a region's commitments were resolved and not fulfilled.
+public void ResolvedByAgreement(SalesRegion region, string why) {
+  var root = region.Disruption.Job;
+  AcceptException(root.Criteria.Single(c => c.Text.StartsWith(region.Name + ":")), why);
+  UnitOfWork.Commit();
+  DisruptionResponse.RaiseRegionSettled(region.Disruption);
+}
+
+/// A count came in: the director records what there is now.
+public void StockCounted(Disruption d, int onHand, string why) { CorrectPool(d.Stock, onHand, why); }
+
+// ── what the app hears from the shared stock ────────────────────────────────────────────────────────────────────────
+
+/// More is held than there is: the response plans again.
+[On] void TheStockFell(PoolOverdrawn e) {
+  var d = Disruption.FirstOrDefault(x => x.Stock == e.Pool && (x.Stage == ResponseStage.Executing));
+  if (d != null) { DisruptionResponse.RaiseStockChanged(d!); }
+}
+
+/// A region holds less than its plan counted on: its plan is back in question.
+[On] void ARegionGaveWay(AllocationCut e) {
+  var region = SalesRegion.FirstOrDefault(r => r.Job == e.Allocation.Assignment);
+  if (region == null) { return; }
+  region!.FromStock = (int)e.To;
+  region!.NeedsReplan = true;
+  ReopenCriterion(CriterionOf(region!.Job!, "plan"), $"Its share of {e.Allocation.Pool.Title} was cut from {Amount(e.Allocation.Pool, e.From)} to {Amount(e.Allocation.Pool, e.To)}: {e.Why}");
+}
+
+/// A region that waited is served.
+[On] void ARegionIsServed(AllocationHeld e) {
+  if (!e.AfterWaiting) { return; }
+  var region = SalesRegion.FirstOrDefault(r => r.Job == e.Allocation.Assignment);
+  if (region == null) { return; }
+  region!.FromStock = (int)e.Allocation.Amount;
+  region!.Waiting = 0;
+}
+
+/// What somebody outside answered for a region is kept on the region's job, as what they said.
+[On] void TheFoundryAnswered(HumanRequestAnswered e) {
+  var r = e.Request;
+  if (r.OutsideEmail == "" || r.SubjectType != "SalesRegion") { return; }
+  var region = SalesRegion.FirstOrDefault(x => x.Id == r.SubjectId);
+  if (region == null || region!.Job == null || region!.Job!.State != AssignmentState.Open) { return; }
+  var answer = OutcomeOf(r);
+  var offer = answer.As<FoundryOffer>();
+  AddItem(region!.Job!, new NewItem { Kind = ItemKind.Correspondence, Key = "foundry", Title = r.OutsideName + " on the housings",
+                                      Content = (offer.CanDeliver ? "Can deliver in time, at " : "Cannot deliver in time; the price would be ") + offer.PriceEach.ToString("0") + " EUR each.",
+                                      Source = new ItemSource { From = answer.ByName + ", through the link sent to " + r.OutsideEmail } });
+}
+
+// ── what the plant hears, and sends ─────────────────────────────────────────────────────────────────────────────────
+
+entity Heard {
+  [Required, MaxLength(40)] string What;
+  [MaxLength(200)] string To = "";
+  [MaxLength(300)] string Title = "";
+  [MaxLength(4000)] string About = "";
+  security { allow read, create when IsAuthenticated || IsAnonymous; }
+}
+
+[On] void MailTheLink(HumanRequestPut e) {
+  if (e.Request.OutsideEmail != "") { new Heard { What = "mailed", To = e.Request.OutsideEmail, Title = e.Request.Title, About = AnswerLinkFor(e.Request) }; }
+}
+
+[AuthMethod]
+string SignInWithCode(string email, string code) {
+  var p = Person.FirstOrDefault(x => x.Email == NormalisedEmail(email));
+  if (p == null || !p.IsActive) { Security.VerifyPassword(code); return ""; }
+  if (!Security.VerifyPassword(code, p.CodeHash)) { return ""; }
+  return Security.IssueJwt(p.Id, p.Email);
+}
+
+app.AuthBootstrap = new AuthBootstrap { Role = PlantRole.Authenticator, Login = SignInWithCode };
+app.Auth = new PasswordAuth { LoginField = Email, PasswordField = CodeHash };
+app.Audit = new AuditConfig { Redact = new AuditRedaction { Properties = [Pumpworks.Person.CodeHash] } };

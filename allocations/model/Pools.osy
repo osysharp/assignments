@@ -1,0 +1,492 @@
+// A shared pool, the claims assignments make on it, and what becomes of them.
+namespace Osysharp.Assignments.Allocations;
+
+using Osysharp.Identity;
+using Osysharp.Assignments;
+
+/// Who keeps the shared pools: opens one, records what there is of it now, and decides who gives way when more is
+/// held than there is. Nobody, until the app says: `policy KeepsSharedPools => IsOperationsDirector;`.
+virtual policy KeepsSharedPools => false;
+
+/// Who may see the pools and claim from them, for an assignment they act on. Nobody, until the app says.
+virtual policy ClaimsFromSharedPools => false;
+
+/// ⭐ SOMETHING THERE IS A COUNTED AMOUNT OF, that several assignments draw on: stock, hours, money.
+public entity SharedPool {
+  /// What it is found by — the app's own name for it.
+  [Required, Unique, Immutable, MaxLength(120)] string Key;
+  [Required, MaxLength(200)] string Title;
+  /// What it is counted in, as a person reads it: "housings", "hours", "EUR". "": a bare number.
+  [MaxLength(40)] string Unit = "";
+  /// How much there is now.
+  decimal Available = 0;
+  /// How much of it assignments hold. Kept by the kit. Checked on every write, so two claims made at the same moment
+  /// cannot both pass.
+  [ConcurrencyCheck] decimal Held = 0;
+  /// Since when more is held than there is. Null: it is not.
+  DateTime? OverdrawnAt;
+  /// Why the amount was last changed, in words.
+  [MaxLength(600)] string LastChange = "";
+  DateTime? LastChangedAt;
+  [Immutable] DateTime OpenedAt = DateTime.UtcNow;
+
+  security {
+    allow read when KeepsSharedPools || ClaimsFromSharedPools || OverseesAssignments;
+    allow create when KeepsSharedPools;
+    allow update when KeepsSharedPools || ClaimsFromSharedPools;
+    deny create except via OpenPool;
+    deny update Title, Unit except via RenamePool;
+    deny update Available, LastChange, LastChangedAt except via CorrectPool, UseAllocation;
+    deny update Held except via Claim, GrantWaiting, LetGo, UseAllocation, CutAllocation;
+    deny update OverdrawnAt except via CorrectPool, SettleOverdraft;
+    deny delete;
+  }
+}
+
+/// Where a claim stands. ⚠ Appended, never inserted: an enum is stored by position.
+public enum AllocationState {
+  /// The assignment holds it: nobody else can.
+  [Label("Held")] Held,
+  /// It did not fit when it was asked for, and waits its turn.
+  [Label("Waiting")] Waiting,
+  /// It was given back — by the assignment, or because the assignment closed.
+  [Label("Released")] Released,
+  /// It was used: it is gone from the pool for good.
+  [Label("Used")] Used,
+  /// The pool's keeper took all of it away when there turned out to be less than was thought.
+  [Label("Taken away")] Cut,
+  /// It was asked for and given up before it was ever held.
+  [Label("Withdrawn")] Withdrawn,
+}
+
+/// The number each claim on one pool is given, in the order it was made — the order waiting claims are served in.
+Counter AllocationNumber = new() { Start = 0 };
+
+/// ⭐ ONE ASSIGNMENT'S CLAIM ON A POOL: how much, why, and where it stands.
+[Unique(Pool, Assignment, Key)]
+public entity Allocation {
+  [Required, Immutable, Index] SharedPool Pool;
+  [Required, Immutable, Index] Assignment Assignment;
+  /// What it is found by on its assignment: claim again under the same key and the claim already made is answered.
+  [Required, Immutable, MaxLength(200)] string Key;
+  [Counter(AllocationNumber, scope = Pool)] int Number;
+  decimal Amount;
+  /// What was first asked for — `Amount` is what it is now, after the keeper took some away.
+  [Immutable] decimal Asked;
+  AllocationState State = AllocationState.Held;
+  /// What it is for, in words — what everybody who sees the pool reads it by.
+  [MaxLength(600)] string Why = "";
+  /// The pool is overdrawn and this share of it has not been decided yet.
+  bool InQuestion = false;
+  /// How it last changed, in words — why it gave way, why it was released. Who did it is on the assignment's activity.
+  [MaxLength(600)] string Note = "";
+  [Immutable] DateTime At = DateTime.UtcNow;
+  DateTime? HeldAt;
+  DateTime? EndedAt;
+
+  security {
+    allow read when KeepsSharedPools || ClaimsFromSharedPools || OverseesAssignments;
+    allow read when IsAuthenticated where AssignmentParticipant.Any(p => p.Assignment.Id == Assignment.Id && p.Person == user);
+    // A claim is made for an assignment by somebody who acts on it — or by whoever oversees assignments.
+    allow create when ClaimsFromSharedPools where AssignmentParticipant.Any(p => p.Assignment.Id == Assignment.Id && p.Person == user && p.Acts);
+    allow create when ClaimsFromSharedPools && OverseesAssignments;
+    allow update when KeepsSharedPools || ClaimsFromSharedPools;
+    deny create except via Claim, AskFor;
+    deny update Amount except via CutAllocation;
+    deny update State except via GrantWaiting, LetGo, UseAllocation, CutAllocation;
+    deny update EndedAt except via LetGo, UseAllocation, CutAllocation;
+    deny update HeldAt except via GrantWaiting;
+    deny update Note except via LetGo, UseAllocation, CutAllocation;
+    deny update InQuestion except via LetGo, CorrectPool, CutAllocation, SettleOverdraft;
+    deny update Why;
+    deny delete;
+  }
+}
+
+/// A claim that does not fit: how much is left, and who holds the rest.
+public class NotEnoughLeft : ValidationException {
+  public decimal Left;
+}
+
+// ── what happened, as events ────────────────────────────────────────────────────────────────────────────────────────
+
+[Event("Allocation held")]
+public sealed class AllocationHeld {
+  public Allocation Allocation;
+  /// It had waited its turn, and now holds what it asked for.
+  public bool AfterWaiting = false;
+  public override string Sentence() { return $"“{Allocation.Assignment.Title}” holds {Amount(Allocation.Pool, Allocation.Amount)} of {Allocation.Pool.Title}."; }
+}
+
+[Event("Allocation waiting")]
+public sealed class AllocationWaiting {
+  public Allocation Allocation;
+  public override string Sentence() { return $"“{Allocation.Assignment.Title}” waits for {Amount(Allocation.Pool, Allocation.Amount)} of {Allocation.Pool.Title}."; }
+}
+
+[Event("Allocation given back")]
+public sealed class AllocationReleased {
+  public Allocation Allocation;
+  public string Why = "";
+  public override string Sentence() { return $"“{Allocation.Assignment.Title}” gave back {Amount(Allocation.Pool, Allocation.Asked)} of {Allocation.Pool.Title}: {Why}"; }
+}
+
+/// More is held than there is. Whoever keeps the pool decides who gives way; an app hears this to tell them.
+[Event("Pool overdrawn")]
+public sealed class PoolOverdrawn {
+  public SharedPool Pool;
+  /// How much more is held than there is.
+  public decimal By;
+  public string Why = "";
+  public override string Sentence() { return $"{Pool.Title} is overdrawn by {Amount(Pool, By)}: {Why}"; }
+}
+
+/// An assignment holds less than it did, by the keeper's decision. An app hears this to plan again.
+[Event("Allocation cut")]
+public sealed class AllocationCut {
+  public Allocation Allocation;
+  public decimal From;
+  public decimal To;
+  public string Why = "";
+  public override string Sentence() { return $"“{Allocation.Assignment.Title}” holds {Amount(Allocation.Pool, To)} of {Allocation.Pool.Title}, down from {Amount(Allocation.Pool, From)}: {Why}"; }
+}
+
+// ── pools ───────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// What a pool is opened with.
+public class NewPool {
+  public string Key = "";
+  public string Title = "";
+  public string Unit = "";
+  public decimal Available = 0;
+}
+
+/// An amount of a pool, as a person reads it: "80 housings".
+public string Amount(SharedPool pool, decimal amount) {
+  var n = amount == Math.Floor(amount) ? amount.ToString("0") : amount.ToString("0.##");
+  return pool.Unit == "" ? n : n + " " + pool.Unit;
+}
+
+/// ⭐ OPEN A POOL — or answer the one already open under the same key.
+[Server, Authorize(KeepsSharedPools)]
+public SharedPool OpenPool(NewPool what) {
+  if (what.Key.Trim() == "") { throw new ValidationException("Give the pool a key: what the app finds it by."); }
+  if (what.Title.Trim() == "") { throw new ValidationException("Say what the pool is, as a person reads it."); }
+  if (what.Available < 0) { throw new ValidationException("A pool cannot hold less than nothing."); }
+  var there = SharedPool.FirstOrDefault(p => p.Key == what.Key.Trim());
+  if (there != null) { return there!; }
+  return new SharedPool { Key = what.Key.Trim(), Title = what.Title.Trim(), Unit = what.Unit.Trim(), Available = what.Available };
+}
+
+/// The pool with this key. Throws when there is none.
+public SharedPool PoolBy(string key) {
+  var pool = SharedPool.FirstOrDefault(p => p.Key == key);
+  if (pool == null) { throw new ValidationException($"There is no pool called “{key}”."); }
+  return pool!;
+}
+
+[Server, Authorize(KeepsSharedPools)]
+public void RenamePool(SharedPool pool, string title, string unit) {
+  if (title.Trim() == "") { throw new ValidationException("Say what the pool is, as a person reads it."); }
+  pool.Title = title.Trim();
+  pool.Unit = unit.Trim();
+}
+
+/// How much of a pool nobody holds. Never less than nothing: an overdrawn pool has none.
+public decimal LeftIn(SharedPool pool) { return pool.Available > pool.Held ? pool.Available - pool.Held : 0; }
+
+// ── claims ──────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+void RequireClaimable(SharedPool pool, Assignment a, decimal amount, string what) {
+  if (amount <= 0) { throw new ValidationException("Say how much: more than nothing."); }
+  if (what.Trim() == "") { throw new ValidationException("Say what it is for, as everybody who sees the pool will read it: “Nordic orders due this month”."); }
+  if (a.State != AssignmentState.Open) { throw new AssignmentClosed($"“{a.Title}” is closed: it claims nothing more."); }
+}
+
+/// What is held of a pool and what for, in one sentence — what a refusal tells whoever was refused. It names each
+/// claim by what its claimant said it is for: whoever sees a pool need not be on the assignments that draw on it.
+string HoldersOf(SharedPool pool) {
+  var held = Allocation.Where(c => c.Pool == pool && c.State == AllocationState.Held).OrderBy(c => c.Number).ToList();
+  if (held.Count == 0) { return "Nobody holds any of it."; }
+  return "Held: " + string.Join("; ", held.Select(c => $"{Amount(pool, c.Amount)} for {c.Why}").ToList()) + ".";
+}
+
+Allocation? ClaimUnder(SharedPool pool, Assignment a, string key) {
+  return Allocation.FirstOrDefault(c => c.Pool == pool && c.Assignment == a && c.Key == key);
+}
+
+/// ⭐ CLAIM SOME OF A POOL FOR AN ASSIGNMENT. Held at once, or refused with `NotEnoughLeft` saying how much is left
+/// and what the rest is held for. Claimed again under the same `key`, the claim already made is answered.
+///
+/// `why` is what the claim is FOR, as everybody who sees the pool reads it — they need not be on the assignment.
+///
+///     Claim(stock, nordics, 80, "Nordic orders due this month", key: "march");
+[Server, Authorize(ClaimsFromSharedPools)]
+public Allocation Claim(SharedPool pool, Assignment a, decimal amount, string why, string key = "") {
+  RequireClaimable(pool, a, amount, why);
+  var under = key.Trim() == "" ? Guid.NewGuid().ToString() : key.Trim();
+  var there = ClaimUnder(pool, a, under);
+  if (there != null) { return there!; }
+  var left = LeftIn(pool);
+  if (amount > left) {
+    throw new NotEnoughLeft($"{Amount(pool, left)} of {pool.Title} " + (left == 1 ? "is" : "are") + $" left, and “{a.Title}” asked for {Amount(pool, amount)}. {HoldersOf(pool)}") { Left = left };
+  }
+  var claim = new Allocation { Pool = pool, Assignment = a, Key = under, Amount = amount, Asked = amount, Why = why.Trim(),
+                               State = AllocationState.Held, HeldAt = DateTime.UtcNow };
+  pool.Held = pool.Held + amount;
+  NoteActivity(a, ActivityKind.Note, $"Holds {Amount(pool, amount)} of {pool.Title}" + (claim.Why == "" ? "." : ": " + claim.Why));
+  Raise(new AllocationHeld { Allocation = claim });
+  return claim;
+}
+
+/// What the work an assignment carries while a claim of its waits is found by.
+public string WaitingWorkKey(Allocation claim) { return "allocation-" + claim.Id.ToString(); }
+
+/// ⭐ ASK FOR SOME OF A POOL, AND WAIT FOR IT IF IT DOES NOT FIT. Held at once when there is room. Otherwise the
+/// claim waits its turn — served in the order claims were made, when room appears — and the assignment carries a
+/// piece of blocked work that says what it is waiting for.
+[Server, Authorize(ClaimsFromSharedPools)]
+public Allocation AskFor(SharedPool pool, Assignment a, decimal amount, string why, string key = "") {
+  RequireClaimable(pool, a, amount, why);
+  var under = key.Trim() == "" ? Guid.NewGuid().ToString() : key.Trim();
+  var there = ClaimUnder(pool, a, under);
+  if (there != null) { return there!; }
+  // Nobody jumps the queue: with somebody already waiting, a new claim waits behind them even if it would fit.
+  var queued = Allocation.Any(c => c.Pool == pool && c.State == AllocationState.Waiting);
+  if (!queued && amount <= LeftIn(pool)) { return Claim(pool, a, amount, why, under); }
+  var claim = new Allocation { Pool = pool, Assignment = a, Key = under, Amount = amount, Asked = amount, Why = why.Trim(),
+                               State = AllocationState.Waiting };
+  UnitOfWork.Commit();
+  var work = AttachWork(a, new WorkAttachment { Kind = WorkKind.Other, Key = WaitingWorkKey(claim),
+                                                Title = $"Wait for {Amount(pool, amount)} of {pool.Title}", WaitingFor = "room in " + pool.Title });
+  BlockWork(work, $"{Amount(pool, LeftIn(pool))} left. {HoldersOf(pool)}");
+  Raise(new AllocationWaiting { Allocation = claim });
+  return claim;
+}
+
+/// There may be room in a pool that was not there before: something was given back, cut, or counted.
+[Event("Pool changed")]
+public sealed class PoolChanged {
+  public SharedPool Pool;
+  public override string Sentence() { return $"{Pool.Title} changed: {Amount(Pool, LeftIn(Pool))} left."; }
+}
+
+/// Whoever waits is served by the app itself, never by whoever made the room: they are seldom on the assignment
+/// that waited, and may not read it.
+[On] void ServeWhoWaits(PoolChanged e) { GrantWaiting(e.Pool); }
+
+/// Give waiting claims what they asked for, in the order they asked, for as long as the next one fits.
+[Server, Authorize(IsTheApp)]
+internal void GrantWaiting(SharedPool pool) {
+  if (pool.OverdrawnAt != null) { return; }
+  foreach (var claim in Allocation.Where(c => c.Pool == pool && c.State == AllocationState.Waiting).OrderBy(c => c.Number).ToList()) {
+    if (claim.Assignment.State != AssignmentState.Open) { continue; }
+    if (claim.Amount > LeftIn(pool)) { return; }
+    claim.State = AllocationState.Held;
+    claim.HeldAt = DateTime.UtcNow;
+    pool.Held = pool.Held + claim.Amount;
+    var work = WorkOf(claim.Assignment, WaitingWorkKey(claim));
+    if (work != null && work!.State == WorkState.Open) { CloseWork(work!, WorkState.Done, $"Holds {Amount(pool, claim.Amount)} of {pool.Title}."); }
+    NoteActivity(claim.Assignment, ActivityKind.Note, $"Holds {Amount(pool, claim.Amount)} of {pool.Title}, after waiting for it.");
+    Raise(new AllocationHeld { Allocation = claim, AfterWaiting = true });
+  }
+}
+
+void EndWaitingWork(Allocation claim, string why) {
+  var work = WorkOf(claim.Assignment, WaitingWorkKey(claim));
+  if (work != null && work!.State == WorkState.Open) { CloseWork(work!, WorkState.Cancelled, why); }
+}
+
+/// ⭐ GIVE A CLAIM BACK. What was held is free again, and whoever waits is served. A claim that was still waiting is
+/// withdrawn.
+[Server, Authorize(ClaimsFromSharedPools)]
+public void ReleaseAllocation(Allocation claim, string why) {
+  if (why.Trim() == "") { throw new ValidationException("Say why it is given back."); }
+  LetGo(claim, why.Trim(), true);
+  Raise(new PoolChanged { Pool = claim.Pool });
+}
+
+[Server, Authorize(IsAuthenticated)]
+internal void LetGo(Allocation claim, string why, bool tell) {
+  if (claim.State == AllocationState.Waiting) {
+    claim.State = AllocationState.Withdrawn;
+    claim.EndedAt = DateTime.UtcNow;
+    claim.Note = why;
+    EndWaitingWork(claim, why);
+    return;
+  }
+  if (claim.State != AllocationState.Held) { return; }
+  var pool = claim.Pool;
+  pool.Held = pool.Held - claim.Amount;
+  claim.State = AllocationState.Released;
+  claim.InQuestion = false;
+  claim.EndedAt = DateTime.UtcNow;
+  claim.Note = why;
+  SettleOverdraft(pool);
+  if (tell && claim.Assignment.State == AssignmentState.Open) {
+    NoteActivity(claim.Assignment, ActivityKind.Note, $"Gave back {Amount(pool, claim.Amount)} of {pool.Title}: {why}");
+  }
+  Raise(new AllocationReleased { Allocation = claim, Why = why });
+}
+
+/// ⭐ IT WAS USED: shipped, spent, worked. It is gone from the pool for good, and the assignment no longer holds it.
+[Server, Authorize(ClaimsFromSharedPools)]
+public void UseAllocation(Allocation claim, string what) {
+  if (claim.State != AllocationState.Held) { throw new ValidationException($"Only what is held can be used: this claim is {claim.State.Label.ToLower()}."); }
+  if (claim.InQuestion) { throw new ValidationException($"{claim.Pool.Title} is overdrawn, and this share of it has not been decided: it cannot be used yet."); }
+  var pool = claim.Pool;
+  pool.Held = pool.Held - claim.Amount;
+  pool.Available = pool.Available - claim.Amount;
+  pool.LastChange = $"“{claim.Assignment.Title}” used {Amount(pool, claim.Amount)}.";
+  pool.LastChangedAt = DateTime.UtcNow;
+  claim.State = AllocationState.Used;
+  claim.EndedAt = DateTime.UtcNow;
+  claim.Note = what.Trim();
+  NoteActivity(claim.Assignment, ActivityKind.Note, $"Used {Amount(pool, claim.Amount)} of {pool.Title}" + (claim.Note == "" ? "." : ": " + claim.Note));
+}
+
+// ── when there is less, or more, than was thought ───────────────────────────────────────────────────────────────────
+
+/// The pool is no longer overdrawn: nobody's share is in question any more.
+[Server, Authorize(IsAuthenticated)]
+internal void SettleOverdraft(SharedPool pool) {
+  if (pool.OverdrawnAt == null || pool.Held > pool.Available) { return; }
+  pool.OverdrawnAt = null;
+  foreach (var c in Allocation.Where(c => c.Pool == pool && c.InQuestion).ToList()) { c.InQuestion = false; }
+}
+
+/// ⭐ RECORD WHAT THERE IS NOW — a count came in, a delivery arrived, a line went down. With more room, whoever waits
+/// is served. With LESS than is held the pool is overdrawn: every assignment holding some of it is told its share is
+/// in question, nothing of it can be used, and `PoolOverdrawn` is raised. The kit takes nothing from anybody.
+[Server, Authorize(KeepsSharedPools)]
+public void CorrectPool(SharedPool pool, decimal available, string why) {
+  if (available < 0) { throw new ValidationException("A pool cannot hold less than nothing."); }
+  if (why.Trim() == "") { throw new ValidationException("Say why the amount changed."); }
+  var before = pool.Available;
+  pool.Available = available;
+  pool.LastChange = why.Trim();
+  pool.LastChangedAt = DateTime.UtcNow;
+  if (pool.Held > available) {
+    var first = pool.OverdrawnAt == null;
+    pool.OverdrawnAt = pool.OverdrawnAt ?? DateTime.UtcNow;
+    var over = pool.Held - available;
+    foreach (var c in Allocation.Where(c => c.Pool == pool && c.State == AllocationState.Held).ToList()) {
+      var told = c.InQuestion;
+      c.InQuestion = true;
+      if (!told) {
+        NoteActivity(c.Assignment, ActivityKind.Note,
+          $"{pool.Title}: {Amount(pool, available)} now, {Amount(pool, before)} before — {why.Trim()} {Amount(pool, pool.Held)} is held, {Amount(pool, over)} too many. This assignment's {Amount(pool, c.Amount)} is in question until it is decided who gives way.");
+      }
+    }
+    Raise(new PoolOverdrawn { Pool = pool, By = over, Why = why.Trim() });
+    return;
+  }
+  SettleOverdraft(pool);
+  Raise(new PoolChanged { Pool = pool });
+}
+
+/// ⭐ DECIDE WHO GIVES WAY: an assignment's claim is cut to `to` (0 takes all of it away). The assignment is told,
+/// with the reason, and `AllocationCut` is raised for the app to plan again. When no more is held than there is,
+/// nobody's share is in question any more.
+[Server, Authorize(KeepsSharedPools)]
+public void CutAllocation(Allocation claim, decimal to, string why) {
+  if (claim.State != AllocationState.Held) { throw new ValidationException($"Only what is held can be cut: this claim is {claim.State.Label.ToLower()}."); }
+  if (to < 0 || to >= claim.Amount) { throw new ValidationException($"Cut it to less than the {Amount(claim.Pool, claim.Amount)} it holds, and not below nothing."); }
+  if (why.Trim() == "") { throw new ValidationException("Say why this assignment gives way."); }
+  var pool = claim.Pool;
+  var from = claim.Amount;
+  pool.Held = pool.Held - (from - to);
+  claim.Amount = to;
+  claim.Note = why.Trim();
+  if (to == 0) { claim.State = AllocationState.Cut; claim.EndedAt = DateTime.UtcNow; claim.InQuestion = false; }
+  SettleOverdraft(pool);
+  if (claim.Assignment.State == AssignmentState.Open) {
+    NoteActivity(claim.Assignment, ActivityKind.Note, $"Holds {Amount(pool, to)} of {pool.Title}, down from {Amount(pool, from)}: {why.Trim()}");
+  }
+  Raise(new AllocationCut { Allocation = claim, From = from, To = to, Why = why.Trim() });
+  Raise(new PoolChanged { Pool = pool });
+}
+
+// ── an assignment that is closed holds nothing ──────────────────────────────────────────────────────────────────────
+
+[Server, Authorize(IsTheApp)]
+internal void LetGoOfEverything(Assignment a, string why) {
+  List<SharedPool> pools = [];
+  foreach (var claim in Allocation.Where(c => c.Assignment == a && (c.State == AllocationState.Held || c.State == AllocationState.Waiting)).ToList()) {
+    LetGo(claim, why, false);
+    if (!pools.Any(p => p.Id == claim.Pool.Id)) { pools.Add(claim.Pool); }
+  }
+  foreach (var pool in pools) { GrantWaiting(pool); }
+}
+
+[On] void GiveBackWhenDone(AssignmentCompleted e) { LetGoOfEverything(e.Assignment, "The assignment was completed."); }
+[On] void GiveBackWhenCalledOff(AssignmentCancelled e) { LetGoOfEverything(e.Assignment, "The assignment was called off: " + e.Why); }
+[On] void GiveBackWhenFailed(AssignmentFailed e) { LetGoOfEverything(e.Assignment, "The assignment failed: " + e.Why); }
+
+// ── read back ───────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// One claim, as a list shows it.
+public class AllocationLine {
+  public Guid Id;
+  public Guid Assignment;
+  public string AssignmentTitle = "";
+  public Guid Pool;
+  public string PoolTitle = "";
+  public string Amount = "";
+  public string State = "";
+  public bool Held = false;
+  public bool Waiting = false;
+  public bool InQuestion = false;
+  public string Why = "";
+  public string Note = "";
+}
+
+/// A pool, as its page shows it.
+public class PoolView {
+  public Guid Id;
+  public string Title = "";
+  public string Available = "";
+  public string Held = "";
+  public string Left = "";
+  public bool Overdrawn = false;
+  /// By how much, in words. "": it is not.
+  public string OverdrawnBy = "";
+  public string LastChange = "";
+  public List<AllocationLine> Holding = [];
+  public List<AllocationLine> Waiting = [];
+  public List<AllocationLine> Ended = [];
+}
+
+AllocationLine LineOf(Allocation c) {
+  return new AllocationLine {
+    // The assignment's title is whoever-is-reading's to read or it is not; a claim they may not name is named by
+    // what it is for.
+    Id = c.Id, Assignment = c.Assignment.Id, AssignmentTitle = c.Assignment.Title ?? "", Pool = c.Pool.Id, PoolTitle = c.Pool.Title,
+    Amount = Amount(c.Pool, c.State == AllocationState.Held || c.State == AllocationState.Waiting ? c.Amount : c.Asked),
+    State = c.State.Label, Held = c.State == AllocationState.Held, Waiting = c.State == AllocationState.Waiting,
+    InQuestion = c.InQuestion, Why = c.Why, Note = c.Note,
+  };
+}
+
+/// ⭐ A POOL AS A PERSON READS IT: how much there is, how much is held and by whom, who waits, and what ended.
+[Server, Authorize(IsAuthenticated)]
+public PoolView PoolOf(Guid pool) {
+  var p = SharedPool.FirstOrDefault(x => x.Id == pool);
+  if (p == null) { throw new NotAuthorized("This pool is not yours to read."); }
+  var all = Allocation.Where(c => c.Pool == p).OrderBy(c => c.Number).ToList();
+  return new PoolView {
+    Id = p!.Id, Title = p!.Title, Available = Amount(p!, p!.Available), Held = Amount(p!, p!.Held), Left = Amount(p!, LeftIn(p!)),
+    Overdrawn = p!.OverdrawnAt != null, OverdrawnBy = p!.Held > p!.Available ? Amount(p!, p!.Held - p!.Available) : "",
+    LastChange = p!.LastChange,
+    Holding = all.Where(c => c.State == AllocationState.Held).Select(c => LineOf(c)).ToList(),
+    Waiting = all.Where(c => c.State == AllocationState.Waiting).Select(c => LineOf(c)).ToList(),
+    Ended = all.Where(c => c.State != AllocationState.Held && c.State != AllocationState.Waiting).Select(c => LineOf(c)).ToList(),
+  };
+}
+
+/// What an assignment holds and waits for, of every pool — as whoever is looking may read it.
+[Server, Authorize(IsAuthenticated)]
+public List<AllocationLine> AllocationsOf(Guid assignment) {
+  return Allocation.Where(c => c.Assignment.Id == assignment && (c.State == AllocationState.Held || c.State == AllocationState.Waiting))
+    .OrderBy(c => c.At).ToList().Select(c => LineOf(c)).ToList();
+}

@@ -1,0 +1,90 @@
+// The pool's own card, and what an assignment holds of shared pools on the assignment's page.
+namespace Osysharp.Assignments.Allocations;
+
+using Osysharp.Assignments;
+
+component AllocationRow(AllocationLine line, bool byAssignment) {
+  render {
+    // On a pool, a claim is named by the assignment it is for — for whoever may read that assignment — and by what
+    // its claimant said it is for, for everybody else.
+    Row(gap: 3, align: Align.Start, py: 2, label: !byAssignment ? line.PoolTitle : line.AssignmentTitle != "" ? line.AssignmentTitle : line.Why) {
+      Stack(gap: 1, grow: 1, minW: "0") {
+        Text(!byAssignment ? line.PoolTitle : line.AssignmentTitle != "" ? line.AssignmentTitle : line.Why, fontWeight: FontWeight.Medium);
+        if (line.Why != "" && (!byAssignment || line.AssignmentTitle != "")) { Text(line.Why, fontSize: FontSize.Label, color: Colors.TextSecondary); }
+        if (line.Note != "") { Text(line.Note, fontSize: FontSize.Label, color: Colors.TextSecondary); }
+      }
+      Row(gap: 2, align: Align.Center, wrap: Wrapping.Wrap, justify: Justify.End) {
+        if (line.InQuestion) { Badge("In question", tone: Tone.Warning); }
+        if (line.Waiting) { Badge("Waiting", tone: Tone.Warning); }
+        if (!line.Held && !line.Waiting) { Badge(line.State, tone: Tone.Ghost); }
+        Text(line.Amount, fontWeight: FontWeight.Semibold);
+      }
+    }
+  }
+}
+
+/// ⭐ A POOL: how much there is, how much is held and by whom, who waits their turn, and what ended. When more is
+/// held than there is it says so first, and by how much.
+///
+/// e.g. `PoolCard(stock.Id);`
+public component PoolCard(Guid pool) {
+  PoolView? view = null;
+  bool loaded = false;
+  on mount {
+    try { view = PoolOf(pool); } catch (Exception ex) { view = null; }
+    loaded = true;
+  }
+  render {
+    if (!loaded) { Stack(gap: 2, label: "Pool") { Skeleton(); Skeleton(SkeletonShape.HalfLine); } }
+    if (loaded && view == null) { Text("This pool is not yours to read.", color: Colors.TextSecondary); }
+    if (loaded && view != null) {
+      Card() {
+        Stack(gap: 4, label: view.Title) {
+          Row(gap: 3, align: Align.Center, wrap: Wrapping.Wrap) {
+            Text(view.Title, fontSize: FontSize.Heading, fontWeight: FontWeight.Semibold);
+            if (view.Overdrawn) { Badge("Overdrawn by " + view.OverdrawnBy, tone: Tone.Danger); }
+          }
+          Row(gap: 8, wrap: Wrapping.Wrap, label: "In figures") {
+            Stack(gap: 1) { Text("In all", fontSize: FontSize.Label, color: Colors.TextMuted); Text(view.Available, fontWeight: FontWeight.Semibold); }
+            Stack(gap: 1) { Text("Held", fontSize: FontSize.Label, color: Colors.TextMuted); Text(view.Held, fontWeight: FontWeight.Semibold); }
+            Stack(gap: 1) { Text("Left", fontSize: FontSize.Label, color: Colors.TextMuted); Text(view.Left, fontWeight: FontWeight.Semibold); }
+          }
+          if (view.LastChange != "") { Text(view.LastChange, fontSize: FontSize.Label, color: Colors.TextSecondary); }
+          Stack(gap: 0, label: "Holding") {
+            Text("Holding", fontSize: FontSize.Label, color: Colors.TextMuted);
+            if (view.Holding.Count == 0) { Text("Nobody holds any of it.", color: Colors.TextSecondary); }
+            foreach (var line in view.Holding) { AllocationRow(line, true); }
+          }
+          if (view.Waiting.Count > 0) {
+            Stack(gap: 0, label: "Waiting their turn") {
+              Text("Waiting their turn", fontSize: FontSize.Label, color: Colors.TextMuted);
+              foreach (var line in view.Waiting) { AllocationRow(line, true); }
+            }
+          }
+          if (view.Ended.Count > 0) {
+            Stack(gap: 0, label: "Given back, used or taken away") {
+              Text("Given back, used or taken away", fontSize: FontSize.Label, color: Colors.TextMuted);
+              foreach (var line in view.Ended) { AllocationRow(line, true); }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/// ⭐ WHAT AN ASSIGNMENT HOLDS OF SHARED POOLS, AND WHAT IT WAITS FOR — drawn on every assignment's page
+/// (`AssignmentView`). Nothing when it holds nothing.
+[Contribution("Shared resources")]
+component AllocationsOnTheAssignment(Guid assignment) : AssignmentPanel {
+  List<AllocationLine> lines = [];
+  on mount { try { lines = AllocationsOf(assignment); } catch (Exception ex) { lines = []; } }
+  render {
+    if (lines.Count > 0) {
+      Stack(gap: 0, label: "Shared resources") {
+        Text("Shared resources", fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+        foreach (var line in lines) { AllocationRow(line, false); }
+      }
+    }
+  }
+}

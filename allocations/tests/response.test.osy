@@ -1,0 +1,485 @@
+// ⭐ ONE DISRUPTION, WALKED FROM END TO END over two weeks in May — the owner's "enterprise disruption response" case.
+//
+//   Mon  5 May  Brask Castings, who cast the housings of the H-40 pump, has shut down. Astrid, the operations
+//               director, reports it: 120 housings are in the Malmö warehouse, and three regions have orders that
+//               need them. The response coordinator has the stock read and each region assessed — four specialists
+//               at once; the one reading the UK's order book runs out of its allowance. A job is opened under the
+//               response for each region, and the UK's lead is asked what no agent worked out.
+//   Tue  6 May  Deniz answers: 30. The planner plans each region in turn. Nordics: it proposes to take 100; Bram
+//               says no — they need 80; it proposes 80, and he says yes. DACH: 60 is approved and REFUSED BY THE
+//               STOCK — 40 are left; it takes the 40 and asks a foundry outside for 20. UK: nothing is left; it
+//               waits its turn. The plan as a whole goes to Astrid.
+//   Wed  7 May  She approves it.          Thu 8 May  The foundry answers through its link.
+//   Fri  9 May  Deniz moves to another job; the UK's job is handed to Bram.
+//   Mon 12 May  The UK's customers agree to wait for the new supplier: its job is called off — and what it waited
+//               for with it — and Astrid accepts in writing that it was resolved, not fulfilled.
+//               The same day a count finds 30 housings damaged. 120 are held and 90 exist: the stock is overdrawn,
+//               both regions are told their share is in question, and the response plans again.
+//   Tue 13 May  Astrid decides: the Nordics give way by 30. The planner revises their plan — it proposes to move 30
+//               housings' worth of orders to June — and Bram approves the revised plan.
+//   Fri 16 May  Both regions report what shipped. Every commitment is fulfilled or resolved, and the response ends.
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.HumanRequests.Processes;
+using Osysharp.Assignments;
+using Osysharp.Assignments.Allocations;
+using Osysharp.Assignments.WorkQueues;
+using Osysharp.Assignments.Agents;
+using Osysharp.WorkRepositories;
+using Osysharp.WorkRepositories.Agents;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Agents.HumanRequests;
+using Osysharp.Agents.Inspector;
+using Osysharp.Agents.Processes;
+using Osysharp.Processes;
+using Osysharp.Workflow;
+using Pumpworks;
+
+Disruption TheDisruption(Guid id) { return Disruption.Single(d => d.Id == id); }
+SalesRegion Region(string name) { return SalesRegion.Single(r => r.Name == name); }
+string RegionArg(SalesRegion r) { return "{\"region\":\"" + r.Id.ToString() + "\"}"; }
+string HousingsArgs(SalesRegion r, int housings) { return "{\"region\":\"" + r.Id.ToString() + "\",\"housings\":" + housings.ToString() + "}"; }
+
+/// A region's order book read, what it needs recorded, and that handed back.
+AgentScript Assesses(SalesRegion r, int housings, int input = 100, int output = 20) {
+  return AgentScript.Of(
+    Says.Tool(Actions.Of(OrdersAtRisk), RegionArg(r), input, output),
+    Says.Tool(Actions.Of(RecordNeed), HousingsArgs(r, housings)),
+    Says.HandBack(new NeedReading { Housings = housings }));
+}
+
+/// ⭐ WHAT EACH MODEL SAYS, from the disruption as it stands when a model is asked.
+AgentCast ThePlantsAgents(Disruption d) {
+  var nordics = Region("Nordics"); var dach = Region("DACH"); var uk = Region("UK");
+  return AgentCast.Of()
+    .PlaysAbout<ResponseCoordinator>("Assess the disruption", AgentScript.Of(
+      Says.Together(
+        Says.HandTo<StockAnalyst>(new ReadTheStock(), Says.Row(d.Id)),
+        Says.HandTo<ImpactAnalyst>(new AssessARegion(), Says.Row(nordics.Id), call: "a"),
+        Says.HandTo<ImpactAnalyst>(new AssessARegion(), Says.Row(dach.Id), call: "b"),
+        Says.HandTo<ImpactAnalyst>(new AssessARegion(), Says.Row(uk.Id), call: "c")),
+      Says.HandBack(new Assessment { Stock = "120 housings in Malmö.", NotAssessed = ["UK"] })))
+    .Plays<StockAnalyst>(AgentScript.Of(
+      Says.Tool(Actions.Of(StockOnHand), "{\"disruption\":\"" + d.Id.ToString() + "\"}"),
+      Says.HandBack(new StockReading { Says = "120 housings in the Malmö warehouse." })))
+    .PlaysAbout<ImpactAnalyst>("The orders at risk in Nordics", Assesses(nordics, 80))
+    .PlaysAbout<ImpactAnalyst>("The orders at risk in DACH", Assesses(dach, 60))
+    // The UK's order book is the long one: one answer of 1000 tokens in and 600 out costs 4000 of the analyst's 6000.
+    .PlaysAbout<ImpactAnalyst>("The orders at risk in UK", Assesses(uk, 30, 1000, 600))
+    .PlaysAbout<RecoveryPlanner>("Nordics needs 80 housings this month", AgentScript.Of(
+      Says.Tool("Nordic orders are the largest, and a margin of 20 covers breakage in transit.", Actions.Of(ReserveStock), HousingsArgs(nordics, 100)),
+      Says.Tool("Exactly what the Nordic orders need.", Actions.Of(ReserveStock), HousingsArgs(nordics, 80)),
+      Says.HandBack(new RegionPlan { FromStock = 80, Why = "All 80 from the Malmö stock." })))
+    .PlaysAbout<RecoveryPlanner>("DACH needs 60 housings this month", AgentScript.Of(
+      Says.Tool("What the DACH orders need.", Actions.Of(ReserveStock), HousingsArgs(dach, 60)),
+      Says.Tool("40 are left in Malmö: take those, and find the other 20 elsewhere.", Actions.Of(ReserveStock), HousingsArgs(dach, 40)),
+      Says.Tool(Actions.Of(AskTheFoundry), HousingsArgs(dach, 20)),
+      Says.HandBack(new RegionPlan { FromStock = 40, FromFoundry = 20, Why = "40 from the Malmö stock; Ferrol Foundry is asked for the other 20." })))
+    .PlaysAbout<RecoveryPlanner>("UK needs 30 housings this month", AgentScript.Of(
+      Says.Tool("What the UK orders need.", Actions.Of(ReserveStock), HousingsArgs(uk, 30)),
+      Says.Tool(Actions.Of(WaitForStock), HousingsArgs(uk, 30)),
+      Says.HandBack(new RegionPlan { Waiting = 30, Why = "Nothing is left in Malmö: the UK waits its turn for 30." })))
+    .PlaysAbout<RecoveryPlanner>("Nordics needs 80 housings and now holds 50", AgentScript.Of(
+      Says.Tool(Actions.Of(ListItems), "{\"assignment\":\"" + (nordics.Job == null ? Guid.Empty : nordics.Job!.Id).ToString() + "\"}"),
+      Says.Tool("Orders 14 to 19 are not due at the customer's site until June: move those, and ship the rest now.", Actions.Of(DeferOrders), HousingsArgs(nordics, 30)),
+      Says.HandBack(new RegionPlan { FromStock = 50, Deferred = 30, Why = "50 ship now; orders needing 30 move to June." })));
+}
+
+void TheAgentsAnswer() {
+  ScriptedAnswer.Stub((model, request) => ThePlantsAgents(Disruption.Single()).Answer(model, request));
+}
+
+/// Let whatever waits look again.
+void LetItGoOn(Guid disruption) {
+  for (var i = 0; i < 4; i++) {
+    Background.Settle();
+    runas (Astrid) {
+      foreach (var wait in AgentWait.Where(w => w.Status == AgentWaitStatus.Waiting).ToList()) { Workflow.Settle(wait); }
+      foreach (var wait in AgentWorkWait.ToList()) { Workflow.Settle(wait); }
+      Workflow.Settle(Disruption.Single(d => d.Id == disruption));
+    }
+  }
+}
+
+HumanRequest Mine(string title) { return Requests.Mine().Single(r => r.Title.StartsWith(title)); }
+/// The proposal the planner put to whoever is signed in.
+HumanRequest Proposed() { return Requests.Mine().Single(r => r.Title.Contains(" proposes: ")); }
+ResponseStage StageOf(Guid disruption) { return Disruption.Single(d => d.Id == disruption).Stage; }
+
+/// ⭐ THE FIRST THREE DAYS: from the report to the plan approved.
+Guid TheResponseToThePlan() {
+  TestClock.Set(new DateTime(2031, 5, 5, 8, 0, 0, DateTimeKind.Utc));
+  Guid disruption = Guid.Empty;
+  TheAgentsAnswer();
+  runas (Astrid) {
+    var d = ReportDisruption("Brask Castings has shut down", "Brask cast the housings of the H-40 pump, and will deliver no more. Orders in three regions need them this month.",
+                             "malmo-housings", "Housings in the Malmö warehouse", 120);
+    AddRegion(d, "Nordics", Bram, "Orders 11 to 19: 80 pumps for district heating plants, due in May.");
+    AddRegion(d, "DACH", Clara, "Orders 31 to 36: 60 pumps for two breweries, due in May.");
+    AddRegion(d, "UK", Deniz, "Forty-one orders from distributors, of one to three pumps each, due between May and July.");
+    BeginTheResponse(d);
+    Workflow.Settle(d);
+    disruption = d.Id;
+  }
+  LetItGoOn(disruption);
+
+  // Tue 6 May: Deniz says what the UK needs. The planner plans each region in turn.
+  TestClock.Advance(TimeSpan.FromDays(1));
+  runas (Deniz) { AnswerRequest(Mine("How many housings"), RequestAnswer.Of(new RegionNeed { Housings = 30 })); }
+  LetItGoOn(disruption);
+  runas (Bram) { AnswerRequest(Proposed(), RequestAnswer.Reject("We need 80, not 100. Do not take what the other regions need.")); }
+  LetItGoOn(disruption);
+  runas (Bram) { AnswerRequest(Proposed(), RequestAnswer.Approve()); }
+  LetItGoOn(disruption);
+  runas (Clara) { AnswerRequest(Proposed(), RequestAnswer.Approve()); }
+  LetItGoOn(disruption);
+  runas (Clara) { AnswerRequest(Proposed(), RequestAnswer.Approve()); }
+  LetItGoOn(disruption);
+  runas (Deniz) { AnswerRequest(Proposed(), RequestAnswer.Approve()); }
+  LetItGoOn(disruption);
+
+  // Wed 7 May: Astrid approves the plan as a whole.
+  TestClock.Advance(TimeSpan.FromDays(1));
+  runas (Astrid) { AnswerRequest(Mine("Approve the recovery plan"), RequestAnswer.Approve()); }
+  LetItGoOn(disruption);
+  return disruption;
+}
+
+/// ⭐ …AND THE NINE DAYS AFTER: the foundry answers, the UK is handed over and called off, the stock turns out
+/// short, the director decides who gives way, one region plans again, and both ship.
+void TheResponseFromThePlan(Guid disruption) {
+  TheResponseToTheShortfall(disruption);
+  TheResponseFromTheShortfall(disruption);
+}
+
+void TheResponseToTheShortfall(Guid disruption) {
+  // Thu 8 May: the foundry answers through its link.
+  TestClock.Advance(TimeSpan.FromDays(1));
+  var link = "";
+  runas (Astrid) { link = Heard.Single(h => h.What == "mailed").About; }
+  AnswerByLink(AnswerLink.From(link), new RequestAnswer { Values = new Dictionary<string, string> { ["CanDeliver"] = "true", ["PriceEach"] = "46" } }, "Mateo Ruiz");
+  LetItGoOn(disruption);
+
+  // Fri 9 May: the UK's job is handed to Bram.
+  TestClock.Advance(TimeSpan.FromDays(1));
+  runas (Astrid) { SetAssignmentOwner(Region("UK").Job!, Bram); }
+
+  // Mon 12 May: the UK's customers agree to wait; its job is called off, and resolved by agreement.
+  TestClock.Advance(TimeSpan.FromDays(3));
+  runas (Bram) { CallOffRegion(Region("UK"), "The UK distributors accepted delivery in July, from the new supplier."); }
+  LetItGoOn(disruption);
+  runas (Astrid) { ResolvedByAgreement(Region("UK"), "Resolved with the customers: delivery in July. Not fulfilled this month."); }
+  LetItGoOn(disruption);
+
+  // The same day: a count finds 30 housings damaged.
+  runas (Astrid) { StockCounted(TheDisruption(disruption), 90, "The count found 30 housings damaged by damp."); }
+  LetItGoOn(disruption);
+}
+
+void TheResponseFromTheShortfall(Guid disruption) {
+  // Tue 13 May: the director decides who gives way, and says so. The Nordics plan again.
+  TestClock.Advance(TimeSpan.FromDays(1));
+  runas (Astrid) {
+    CutAllocation(ClaimOf(Region("Nordics").Job!.Id), 50, "Nordic orders 14 to 19 can ship in June.");
+    AnswerRequest(Mine("Housings in the Malmö warehouse: more is held"), RequestAnswer.Say("The Nordics give way by 30."));
+  }
+  LetItGoOn(disruption);
+  runas (Bram) { AnswerRequest(Proposed(), RequestAnswer.Approve()); }
+  LetItGoOn(disruption);
+
+  // Fri 16 May: both regions report.
+  TestClock.Advance(TimeSpan.FromDays(3));
+  runas (Bram) { RegionShipped(Region("Nordics"), "50 pumps shipped. Orders 14 to 19 are re-dated to June with each customer's agreement."); }
+  LetItGoOn(disruption);
+  runas (Clara) { RegionShipped(Region("DACH"), "40 pumps shipped from stock. 20 follow on 23 May with Ferrol's housings; both breweries agreed."); }
+  LetItGoOn(disruption);
+}
+
+// ── the case ────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Plant)]
+void a_disruption_is_answered_region_by_region_from_one_stock_and_planned_again_when_the_stock_falls_short() {
+  TestClock.Set(new DateTime(2031, 5, 5, 8, 0, 0, DateTimeKind.Utc));
+  Guid disruption = Guid.Empty;
+
+  // ── Mon 5 May. The report; the stock read and each region assessed, four specialists at once. ──
+  TheAgentsAnswer();
+  runas (Astrid) {
+    var d = ReportDisruption("Brask Castings has shut down", "Brask cast the housings of the H-40 pump, and will deliver no more. Orders in three regions need them this month.",
+                             "malmo-housings", "Housings in the Malmö warehouse", 120);
+    AddRegion(d, "Nordics", Bram, "Orders 11 to 19: 80 pumps for district heating plants, due in May.");
+    AddRegion(d, "DACH", Clara, "Orders 31 to 36: 60 pumps for two breweries, due in May.");
+    AddRegion(d, "UK", Deniz, "Forty-one orders from distributors, of one to three pumps each, due between May and July.");
+    BeginTheResponse(d);
+    Workflow.Settle(d);
+    disruption = d.Id;
+  }
+  LetItGoOn(disruption);
+  runas (Astrid) {
+    var d = TheDisruption(disruption);
+    Assert.Equal(ResponseStage.Assessing, d.Stage);
+    var top = AgentTask.Single(t => t.RunItem == disruption && t.RunState == "Assessing" && t.Parent == null);
+    var tree = Trajectory.Tree(top.Id);
+    Assert.Equal(5, tree.Count);
+    Assert.Equal(1, tree.Count(l => l.EndsWith("Read the stock: Done")));
+    Assert.Equal(2, tree.Count(l => l.EndsWith("Assess a region: Done")));
+    Assert.Equal(1, tree.Count(l => l.EndsWith("Assess a region: Stopped")));
+    Assert.Equal(80, Region("Nordics").Need);
+    Assert.Equal(60, Region("DACH").Need);
+    Assert.Equal(0, Region("UK").Need);
+    // A job under the response for each region — owned by its lead, and part of what "done" means for the whole.
+    Assert.Equal(3, d.Job.Children.Count);
+    Assert.Equal("Bram Okafor", Region("Nordics").Job!.Owner!.DisplayName);
+    Assert.Equal(["The recovery plan is approved", "Nordics: commitments fulfilled or resolved", "DACH: commitments fulfilled or resolved", "UK: commitments fulfilled or resolved"],
+                 d.Job.Criteria.OrderBy(c => c.Position).ToList().Select(c => c.Text).ToList());
+  }
+
+  // ── Tue 6 May. The UK's lead says what no agent worked out. Then each region is planned, in turn. ──
+  TestClock.Advance(TimeSpan.FromDays(1));
+  runas (Deniz) { AnswerRequest(Mine("How many housings"), RequestAnswer.Of(new RegionNeed { Housings = 30 })); }
+  LetItGoOn(disruption);
+  // Nordics first. The planner would take 100; taking stock is the lead's to approve, and he says no.
+  runas (Bram) {
+    var proposal = Proposed();
+    Assert.Equal("Nordic orders are the largest, and a margin of 20 covers breakage in transit.", proposal.Context);
+    AnswerRequest(proposal, RequestAnswer.Reject("We need 80, not 100. Do not take what the other regions need."));
+  }
+  LetItGoOn(disruption);
+  runas (Astrid) { Assert.Equal(0, Stock().Held); }
+  runas (Bram) { AnswerRequest(Proposed(), RequestAnswer.Approve()); }
+  LetItGoOn(disruption);
+  runas (Astrid) { Assert.Equal(80, Stock().Held); }
+  // DACH next. Its lead approves 60 — and the stock refuses it: two regions cannot hold the same housings.
+  runas (Clara) { AnswerRequest(Proposed(), RequestAnswer.Approve()); }
+  LetItGoOn(disruption);
+  runas (Astrid) {
+    Assert.Equal(80, Stock().Held);
+    var planning = AgentTask.Single(t => t.RunState == "Planning" && t.Parent == null && t.About == "Recovery plan: DACH");
+    // What the planner was told is the stock's own sentence: how much is left, and what the rest is held for.
+    var told = string.Join("\n", TraceEvent.Where(e => e.Task == planning.Id).ToList().Select(e => e.Payload ?? "").ToList());
+    Assert.Contains("Refused: 40 housings of Housings in the Malm", told);
+    Assert.Contains("asked for 60 housings. Held: 80 housings for Nordics orders due this month.", told);
+  }
+  // It takes what is left, and asks the foundry outside for the rest.
+  runas (Clara) {
+    Assert.Equal("40 are left in Malmö: take those, and find the other 20 elsewhere.", Proposed().Context);
+    AnswerRequest(Proposed(), RequestAnswer.Approve());
+  }
+  LetItGoOn(disruption);
+  // The UK last: nothing is left, and it waits its turn. Its job says what it waits for.
+  runas (Deniz) { AnswerRequest(Proposed(), RequestAnswer.Approve()); }
+  LetItGoOn(disruption);
+  runas (Astrid) {
+    Assert.Equal(ResponseStage.Deciding, StageOf(disruption));
+    Assert.Equal(120, Stock().Held);
+    var view = PoolOf(Stock().Id);
+    Assert.Equal(["Nordics: keep this month's promises", "DACH: keep this month's promises"], view.Holding.Select(l => l.AssignmentTitle).ToList());
+    Assert.Equal(["80 housings", "40 housings"], view.Holding.Select(l => l.Amount).ToList());
+    Assert.Equal(["30 housings"], view.Waiting.Select(l => l.Amount).ToList());
+    Assert.Equal(20, Region("DACH").FromFoundry);
+    Assert.Equal("sales@ferrol.example", Heard.Single(h => h.What == "mailed").To);
+    var uk = Region("UK").Job!;
+    Assert.True(ConditionsOf(uk).Blocked);
+    Assert.Equal(CriterionState.Met, CriterionOf(Region("Nordics").Job!, "plan").State);
+    // The plan as a whole is hers to approve.
+    var plan = Mine("Approve the recovery plan");
+    Assert.Contains("needs 60: 40 from stock, 20 from the foundry, 0 waiting", plan.FactsJson);
+  }
+
+  // ── Wed 7 May. Approved. Thu 8 May. The foundry answers through its link. ──
+  TestClock.Advance(TimeSpan.FromDays(1));
+  runas (Astrid) { AnswerRequest(Mine("Approve the recovery plan"), RequestAnswer.Approve()); }
+  LetItGoOn(disruption);
+  runas (Astrid) { Assert.Equal(ResponseStage.Executing, StageOf(disruption)); }
+  TestClock.Advance(TimeSpan.FromDays(1));
+  var link = "";
+  runas (Astrid) { link = Heard.Single(h => h.What == "mailed").About; }
+  Assert.Equal("Can you deliver 20 H-40 housings by 23 May?", ViewByLink(AnswerLink.From(link)).Title);
+  AnswerByLink(AnswerLink.From(link), new RequestAnswer { Values = new Dictionary<string, string> { ["CanDeliver"] = "true", ["PriceEach"] = "46" } }, "Mateo Ruiz");
+  LetItGoOn(disruption);
+  runas (Clara) {
+    var said = ItemOf(Region("DACH").Job!, "foundry")!;
+    Assert.Equal("Ferrol Foundry on the housings", said.Title);
+    Assert.Equal("Can deliver in time, at 46 EUR each.", CurrentOf(said).Content);
+    Assert.Equal("Mateo Ruiz, through the link sent to sales@ferrol.example", CurrentOf(said).From);
+  }
+
+  // ── Fri 9 May. The UK's lead moves on: its job is handed to Bram. ──
+  TestClock.Advance(TimeSpan.FromDays(1));
+  runas (Astrid) { SetAssignmentOwner(Region("UK").Job!, Bram); }
+
+  // ── Mon 12 May. The UK's customers agree to wait: its job is called off, and what it waited for with it. ──
+  TestClock.Advance(TimeSpan.FromDays(3));
+  runas (Bram) { CallOffRegion(Region("UK"), "The UK distributors accepted delivery in July, from the new supplier."); }
+  LetItGoOn(disruption);
+  runas (Astrid) {
+    var uk = Region("UK").Job!;
+    Assert.Equal(AssignmentState.Cancelled, uk.State);
+    Assert.Equal(AllocationState.Withdrawn, ClaimOf(uk.Id).State);
+    Assert.Equal(WorkState.Cancelled, WorkOf(uk, WaitingWorkKey(ClaimOf(uk.Id)))!.State);
+    // The response is not done by that: what it promised for the UK is neither fulfilled nor accepted as resolved.
+    Assert.Equal(ResponseStage.Executing, StageOf(disruption));
+    Assert.Throws<CriteriaUnmet>(() => CompleteAssignment(TheDisruption(disruption).Job, "Done."));
+    ResolvedByAgreement(Region("UK"), "Resolved with the customers: delivery in July. Not fulfilled this month.");
+  }
+  LetItGoOn(disruption);
+
+  // ── The same day. A count finds 30 housings damaged: 120 are held, 90 exist. Nothing is taken from anybody. ──
+  runas (Astrid) { StockCounted(TheDisruption(disruption), 90, "The count found 30 housings damaged by damp."); }
+  LetItGoOn(disruption);
+  runas (Astrid) {
+    Assert.Equal(ResponseStage.Replanning, StageOf(disruption));
+    var view = PoolOf(Stock().Id);
+    Assert.Equal("30 housings", view.OverdrawnBy);
+    Assert.True(view.Holding.All(l => l.InQuestion));
+    var ask = Mine("Housings in the Malmö warehouse: more is held");
+    Assert.Equal("The count found 30 housings damaged by damp. There are 90 housings; 120 housings is held. Cut a region's share on the stock's page, then say here what you decided.", ask.Context);
+  }
+  // Both regions are told, on their own jobs — and neither can ship from a share that is in question.
+  runas (Clara) {
+    Assert.True(ActivityOf(Region("DACH").Job!, 50).Any(l => l.Said.EndsWith("This assignment's 40 housings is in question until it is decided who gives way.")));
+    Assert.Throws<ValidationException>(() => RegionShipped(Region("DACH"), "Shipped."));
+    UnitOfWork.Discard();
+  }
+
+  // ── Tue 13 May. The director decides who gives way. That region's plan is back in question, and is made again. ──
+  TestClock.Advance(TimeSpan.FromDays(1));
+  runas (Astrid) {
+    CutAllocation(ClaimOf(Region("Nordics").Job!.Id), 50, "Nordic orders 14 to 19 can ship in June.");
+    AnswerRequest(Mine("Housings in the Malmö warehouse: more is held"), RequestAnswer.Say("The Nordics give way by 30."));
+  }
+  LetItGoOn(disruption);
+  runas (Bram) {
+    var nordics = Region("Nordics");
+    Assert.Equal(50, nordics.FromStock);
+    Assert.Equal(CriterionState.Unmet, CriterionOf(nordics.Job!, "plan").State);
+    // The revised plan moves customers' orders: that is his to approve, again.
+    var proposal = Proposed();
+    Assert.EndsWith("proposes: Move orders to next month", proposal.Title);
+    Assert.Equal("Orders 14 to 19 are not due at the customer's site until June: move those, and ship the rest now.", proposal.Context);
+    AnswerRequest(proposal, RequestAnswer.Approve());
+  }
+  LetItGoOn(disruption);
+  runas (Astrid) {
+    Assert.Equal(ResponseStage.Executing, StageOf(disruption));
+    Assert.Equal(1, TheDisruption(disruption).Replans);
+    Assert.Equal(30, Region("Nordics").Deferred);
+    Assert.Equal(CriterionState.Met, CriterionOf(Region("Nordics").Job!, "plan").State);
+    // DACH's plan was never in question: it was not asked to plan again.
+    Assert.Equal(0, AgentTask.Count(t => t.RunState == "Replanning" && t.About == "Revised plan: DACH"));
+    Assert.False(PoolOf(Stock().Id).Overdrawn);
+  }
+
+  // ── Fri 16 May. Both regions ship. Every commitment is fulfilled or resolved, and the response says which. ──
+  TestClock.Advance(TimeSpan.FromDays(3));
+  runas (Bram) { RegionShipped(Region("Nordics"), "50 pumps shipped. Orders 14 to 19 are re-dated to June with each customer's agreement."); }
+  LetItGoOn(disruption);
+  runas (Astrid) { Assert.Equal(ResponseStage.Executing, StageOf(disruption)); }
+  runas (Clara) { RegionShipped(Region("DACH"), "40 pumps shipped from stock. 20 follow on 23 May with Ferrol's housings; both breweries agreed."); }
+  LetItGoOn(disruption);
+  runas (Astrid) {
+    var d = TheDisruption(disruption);
+    Assert.Equal(ResponseStage.Resolved, d.Stage);
+    Assert.Equal(AssignmentState.CompletedByException, d.Job.State);
+    Assert.Equal("Every region's commitments are fulfilled or resolved.", d.Job.Outcome);
+    Assert.Equal("1 region was resolved by agreement, not fulfilled.", d.Job.Limitations);
+    Assert.Equal(3, d.Job.Criteria.Count(c => c.State == CriterionState.Met));
+    Assert.Equal(1, d.Job.Criteria.Count(c => c.State == CriterionState.Excepted));
+    // What was shipped is gone from the stock; nothing is held, and nobody waits.
+    Assert.Equal(0, Stock().Available);
+    Assert.Equal(0, Stock().Held);
+    Assert.Equal(0, Allocation.Count(c => c.State == AllocationState.Held || c.State == AllocationState.Waiting));
+    Assert.Equal(0, HumanRequest.Count(r => r.Status == RequestStatus.Open));
+  }
+}
+
+// ── read back ───────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Plant)]
+void the_run_of_a_response_tells_the_plan_the_shortfall_and_the_plan_made_again() {
+  var disruption = TheResponseToThePlan();
+  TheResponseFromThePlan(disruption);
+  runas (Astrid) {
+    var view = ProcessRunOf(ProcessRunAbout("DisruptionResponse", disruption)!.Id)!;
+    Assert.Equal("Brask Castings has shut down", view.Card.Title);
+    Assert.Equal("Disruption response", view.Card.Process);
+    Assert.Equal(ProcessStatus.Finished, view.Card.Status);
+    Assert.Equal("11 days", view.Card.Age);
+    Assert.Equal([
+      "Assessing what is at risk", "Planning each region", "Deciding the plan", "Carrying it out", "Planning again", "Carrying it out",
+      "Closing the response", "Resolved",
+    ], view.Stays.Select(s => s.Label).ToList());
+    Assert.Equal([
+      "Response coordinator was given work: assess the disruption.",
+      "Response coordinator finished: assess the disruption.",
+      "Asked Deniz Aydin: “How many housings do UK's orders need this month?”",
+      "1 of the regions could not be assessed by the agents, so each one's lead is asked what it needs.",
+      "Deniz Aydin answered “How many housings do UK's orders need this month?” after 1 day.",
+    ], view.Stays[0].Moments.Select(m => m.Said).ToList());
+    // Three regions planned, one after the other.
+    Assert.Equal(3, view.Stays[1].Moments.Count(m => m.Said == "Recovery planner finished: plan a region."));
+    Assert.Equal("Astrid Holm approved “Approve the recovery plan” after 1 day.", view.Stays[2].Moments.Last().Said);
+    // What sent it back to planning was something the app heard, not somebody's answer.
+    Assert.Equal("The app itself answered the stock changed step.", view.Stays[3].Moments.Last().Said);
+    Assert.Contains("Asked Astrid Holm: “Housings in the Malmö warehouse: more is held than there is. Who gives way?”", view.Stays[4].Moments.Select(m => m.Said).ToList());
+    Assert.Contains("Recovery planner finished: revise a plan.", view.Stays[4].Moments.Select(m => m.Said).ToList());
+    Assert.Equal(1, view.Stays[4].Moments.Count(m => m.Said.StartsWith("Recovery planner was given work")));
+    Assert.True(view.Cost.Known);
+  }
+}
+
+[Test(Plant)]
+void each_reader_of_a_response_sees_what_is_theirs() {
+  var disruption = TheResponseToThePlan();
+  TheResponseToTheShortfall(disruption);
+  Guid run = Guid.Empty;
+  Guid nordics = Guid.Empty;
+  Guid dach = Guid.Empty;
+  Guid stock = Guid.Empty;
+  // The director: the response, every region's job, the stock with who holds what by name, what it all cost.
+  runas (Astrid) {
+    run = ProcessRunAbout("DisruptionResponse", disruption)!.Id;
+    nordics = Region("Nordics").Job!.Id;
+    dach = Region("DACH").Job!.Id;
+    stock = Stock().Id;
+    Assert.Equal(4, Assignment.Count());
+    Assert.True(ProcessRunOf(run)!.Cost.Known);
+    Assert.Equal(["Nordics: keep this month's promises", "DACH: keep this month's promises"], PoolOf(stock).Holding.Select(l => l.AssignmentTitle).ToList());
+  }
+  // A region's lead: her own region's job — not the response above it, and not another region's job. She sees the
+  // stock, and what each share of it is for, in its claimant's words; follows the response; is not shown the cost.
+  runas (Clara) {
+    Assert.Equal(1, Assignment.Count(a => a.Id == dach));
+    Assert.Equal(0, Assignment.Count(a => a.Id == nordics));
+    // Her job opens for her although the response above it is not hers to read: the link says so, and names nothing.
+    var sheet = SheetOf(dach)!;
+    Assert.Equal("DACH: keep this month's promises", sheet.Title);
+    Assert.Contains("Opened under an assignment you are not on", sheet.Links.Select(l => l.How + " " + l.Title).ToList());
+    var pool = PoolOf(stock);
+    Assert.True(pool.Overdrawn);
+    Assert.Equal(["Nordics orders due this month", "DACH orders due this month"], pool.Holding.Select(l => l.Why).ToList());
+    Assert.Equal(["", "DACH: keep this month's promises"], pool.Holding.Select(l => l.AssignmentTitle).ToList());
+    Assert.Equal(["Housings in the Malmö warehouse"], AllocationsOf(dach).Select(l => l.PoolTitle).ToList());
+    Assert.True(AllocationsOf(dach).Single().InQuestion);
+    // What the other region holds she reads as the pool tells it — an amount and what it is for, and no job.
+    Assert.Equal([""], AllocationsOf(nordics).Select(l => l.AssignmentTitle).ToList());
+    Assert.False(ProcessRunOf(run)!.Cost.Known);
+    // She does not decide who gives way.
+    Assert.Throws<NotAuthorized>(() => CutAllocation(Allocation.Single(c => c.Assignment.Id == dach), 10, "Mine."));
+  }
+  // Procurement: none of it.
+  runas (Ebba) {
+    Assert.Equal(0, Assignment.Count());
+    Assert.Equal(0, SharedPool.Count());
+    Assert.Throws<NotAuthorized>(() => ProcessRunOf(run));
+  }
+  // The foundry's link: used, it opens its one request with what was answered — and nothing else.
+  var link = "";
+  runas (Astrid) { link = Heard.Single(h => h.What == "mailed").About; }
+  Assert.Equal("Can you deliver 20 H-40 housings by 23 May?", ViewByLink(AnswerLink.From(link)).Title);
+  Assert.Equal(0, HumanRequest.Count());
+  Assert.Equal(0, SharedPool.Count());
+}

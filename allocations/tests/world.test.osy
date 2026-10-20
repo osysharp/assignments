@@ -1,0 +1,56 @@
+// The plant the tests run in: Astrid, the operations director, keeps the shared stock and decides; Bram, Clara and
+// Deniz each lead a sales region; Ebba buys. A foundry outside has no account.
+using Osysharp.Identity;
+using Osysharp.Organizations;
+using Osysharp.Organizations.ServicePlans;
+using Osysharp.WorkQueues;
+using Osysharp.Assignments;
+using Osysharp.Assignments.Allocations;
+using Osysharp.Agents;
+using Pumpworks;
+
+[TestFixture]
+void Plant() {
+  var astrid = new Person { Email = "astrid@halden.example", DisplayName = "Astrid Holm",  CodeHash = Security.HashPassword("1111") };
+  var bram   = new Person { Email = "bram@halden.example",   DisplayName = "Bram Okafor",  CodeHash = Security.HashPassword("2222") };
+  var clara  = new Person { Email = "clara@halden.example",  DisplayName = "Clara Weiss",  CodeHash = Security.HashPassword("3333") };
+  var deniz  = new Person { Email = "deniz@halden.example",  DisplayName = "Deniz Aydin",  CodeHash = Security.HashPassword("4444") };
+  var ebba   = new Person { Email = "ebba@halden.example",   DisplayName = "Ebba Lund",    CodeHash = Security.HashPassword("5555") };
+  new RoleGrant { Member = astrid, Role = PlantRole.Operations };
+  new RoleGrant { Member = bram,   Role = PlantRole.RegionLead };
+  new RoleGrant { Member = clara,  Role = PlantRole.RegionLead };
+  new RoleGrant { Member = deniz,  Role = PlantRole.RegionLead };
+  new RoleGrant { Member = ebba,   Role = PlantRole.Procurement };
+
+  new OrganizationTier { Name = "Standard", Rank = 1, IsDefault = true };
+  var queue = new Queue { Name = "Response", Position = 1 };
+  foreach (var p in new List<Person> { astrid, bram, clara, deniz, ebba }) { new QueueMember { Queue = queue, Member = p }; }
+  new AgentSeat { Agent = "Pumpworks.ResponseCoordinator", Sponsor = astrid };
+  new AgentSeat { Agent = "Pumpworks.RecoveryPlanner", Sponsor = astrid };
+  new AgentSeat { Agent = "Pumpworks.StockAnalyst", Sponsor = astrid };
+  new AgentSeat { Agent = "Pumpworks.ImpactAnalyst", Sponsor = astrid };
+}
+
+principal Astrid => Person.Single(p => p.Email == "astrid@halden.example");
+principal Bram   => Person.Single(p => p.Email == "bram@halden.example");
+principal Clara  => Person.Single(p => p.Email == "clara@halden.example");
+principal Deniz  => Person.Single(p => p.Email == "deniz@halden.example");
+principal Ebba   => Person.Single(p => p.Email == "ebba@halden.example");
+
+Assignment JobBy(Guid id) { return Assignment.Single(a => a.Id == id); }
+SharedPool Stock() { return PoolBy("malmo-housings"); }
+Allocation ClaimOf(Guid job) { return Allocation.Single(c => c.Assignment.Id == job && c.Key == "stock"); }
+
+/// A pool of 120 housings and a job for each of three regions, each owned by its lead. Answers the jobs' ids, in the
+/// order Nordics, DACH, UK.
+List<Guid> ThreeJobsAndAPool() {
+  List<Guid> jobs = [];
+  runas (Astrid) {
+    OpenPool(new NewPool { Key = "malmo-housings", Title = "Housings in the Malmö warehouse", Unit = "housings", Available = 120 });
+    jobs.Add(OpenAssignment(new NewAssignment { Title = "Nordics", Goal = "Nordic orders ship.", Criteria = ["Shipped"], Owner = Bram }).Id);
+    jobs.Add(OpenAssignment(new NewAssignment { Title = "DACH", Goal = "DACH orders ship.", Criteria = ["Shipped"], Owner = Clara }).Id);
+    jobs.Add(OpenAssignment(new NewAssignment { Title = "UK", Goal = "UK orders ship.", Criteria = ["Shipped"], Owner = Deniz }).Id);
+    UnitOfWork.Commit();
+  }
+  return jobs;
+}

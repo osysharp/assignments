@@ -1,0 +1,30 @@
+// The plant's agents, its one scripted model and its process. In a file of its own with no `namespace`, because an
+// `app.X = …` statement's value is resolved outside the file's namespace.
+using Osysharp.Agents;
+using Osysharp.Agents.HumanRequests;
+using Osysharp.Agents.Inspector;
+using Osysharp.Processes;
+using Osysharp.WorkRepositories;
+using Osysharp.WorkRepositories.Agents;
+using Osysharp.Llm;
+using Osysharp.WorkQueues;
+using Pumpworks;
+
+app.Llm = new LlmSetup {
+  Models = [
+    new LlmModel { Name = "Small", Client = new ScriptedModel { Name = "Small" }, Model = "scripted-small",
+                   Price = new LlmPrice { Input = 1, Output = 5 }, MaxOutputTokens = 1000 },
+  ],
+  Default = "Small",
+};
+
+app.Agents = new AgentsSetup {
+  Agents = [new ResponseCoordinator(), new RecoveryPlanner(), new StockAnalyst(), new ImpactAnalyst()],
+  TaskBudget = 0.05m,
+};
+app.Processes = new ProcessesSetup { Processes = [new DisruptionResponseProcess()], RunPage = "/responses/{run}" };
+app.AgentInspector = new AgentInspectorSetup { WorkPage = "/work/{task}/{step}" };
+app.WorkRepositories = new WorkRepositoriesSetup { ItemPath = "/items/" };
+app.AgentFindings = new AgentFindingsSetup { FileResults = false };
+app.AgentRequests = new AgentRequestsSetup { Queue = "Response" };
+app.Inbox = new InboxSetup { DefaultQueue = "Response" };

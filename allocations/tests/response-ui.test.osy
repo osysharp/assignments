@@ -1,0 +1,167 @@
+// The response, on screen — driven as the people of the plant, at three moments of it: the stock's page and a
+// region's job on the Monday the count comes in short; a region lead's inbox when the planner proposes the revised
+// plan; and the response's run page once it is over. `osy test --pixels` photographs each — wide and on a phone,
+// light and dark (`Ui.Shot`).
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Assignments;
+using Osysharp.Assignments.Allocations;
+using Osysharp.WorkRepositories;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Agents.HumanRequests;
+using Osysharp.Agents.Inspector;
+using Osysharp.Processes;
+using Osysharp.Workflow;
+using Pumpworks;
+
+/// ⭐ THE STOCK, OVERDRAWN: the page says by how much, who holds what, and whose share is in question — to the
+/// director by each job's name, and to a region's lead by what each share is for. The lead's own job says the same
+/// about its share.
+[Test(Plant)]
+void the_stock_says_it_is_overdrawn_and_each_region_sees_its_share_in_question() {
+  var disruption = TheResponseToThePlan();
+  TheResponseToTheShortfall(disruption);
+  Guid stock = Guid.Empty;
+  Guid dach = Guid.Empty;
+  runas (Astrid) { stock = Stock().Id; dach = Region("DACH").Job!.Id; }
+
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Astrid);
+  Ui.Visit("/stock/" + stock);
+  Assert.Visible("Housings in the Malmö warehouse");
+  Assert.Visible("Overdrawn by 30 housings");
+  Assert.Visible("90 housings", within: "In figures");
+  Assert.Visible("120 housings", within: "In figures");
+  Assert.Visible("80 housings", within: "Nordics: keep this month's promises");
+  Assert.Visible("In question", within: "Nordics: keep this month's promises");
+  Assert.Visible("40 housings", within: "DACH: keep this month's promises");
+  Assert.Visible("The assignment was called off: The UK distributors accepted delivery in July, from the new supplier.", within: "Given back, used or taken away");
+  Assert.NoOverflow();
+  Ui.Shot("response-stock-overdrawn-wide-light");
+  Ui.Theme("dark");
+  Ui.Shot("response-stock-overdrawn-wide-dark");
+  Ui.Theme("light");
+
+  Ui.Viewport(390, 844);
+  Ui.Visit("/stock/" + stock);
+  Assert.Visible("Overdrawn by 30 housings");
+  Assert.NoOverflow();
+  Ui.Shot("response-stock-overdrawn-phone-light");
+  Ui.Theme("dark");
+  Ui.Shot("response-stock-overdrawn-phone-dark");
+  Ui.Theme("light");
+
+}
+
+/// A region's lead reads the same page: her own share by her job's name, the other by what it is for — and her
+/// job's own page says what it holds of what is shared, and that it is in question.
+[Test(Plant)]
+void a_regions_lead_sees_her_share_by_name_and_the_others_by_what_they_are_for() {
+  var disruption = TheResponseToThePlan();
+  TheResponseToTheShortfall(disruption);
+  Guid stock = Guid.Empty;
+  Guid dach = Guid.Empty;
+  runas (Astrid) { stock = Stock().Id; dach = Region("DACH").Job!.Id; }
+
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Clara);
+  Ui.Visit("/stock/" + stock);
+  Assert.Visible("40 housings", within: "DACH: keep this month's promises");
+  Assert.Visible("80 housings", within: "Nordics orders due this month");
+  Assert.Hidden("Nordics: keep this month's promises");
+  Ui.Visit("/jobs/" + dach);
+  Assert.Visible("DACH: keep this month's promises");
+  Assert.Visible("Housings in the Malmö warehouse", within: "Shared resources");
+  Assert.Visible("In question", within: "Shared resources");
+  Assert.Visible("Ferrol Foundry on the housings");
+  Assert.NoOverflow();
+  Ui.Shot("response-job-share-in-question-wide-light");
+}
+
+/// ⭐ THE INBOX MOMENT: the revised plan moves customers' orders, so it is put to the region's lead — with what it
+/// would do, why, and the job it is part of.
+[Test(Plant)]
+void a_regions_lead_reads_the_revised_plan_the_planner_proposes_in_his_inbox() {
+  var disruption = TheResponseToThePlan();
+  TheResponseToTheShortfall(disruption);
+  TestClock.Advance(TimeSpan.FromDays(1));
+  runas (Astrid) {
+    CutAllocation(ClaimOf(Region("Nordics").Job!.Id), 50, "Nordic orders 14 to 19 can ship in June.");
+    AnswerRequest(Mine("Housings in the Malmö warehouse: more is held"), RequestAnswer.Say("The Nordics give way by 30."));
+  }
+  LetItGoOn(disruption);
+  Guid item = Guid.Empty;
+  runas (Bram) { item = Proposed().Id; }
+
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Bram);
+  Ui.Visit("/inbox/mine/i/" + item);
+  Assert.Visible("proposes: Move orders to next month");
+  Assert.Visible("Orders 14 to 19 are not due at the customer's site until June: move those, and ship the rest now.");
+  Assert.Visible("30 housings");
+  Assert.Visible("Nordics: keep this month's promises", within: "Part of an assignment");
+  Assert.NoOverflow();
+  Ui.Shot("response-inbox-revised-plan-wide-light");
+  Ui.Theme("dark");
+  Ui.Shot("response-inbox-revised-plan-wide-dark");
+  Ui.Theme("light");
+
+  Ui.Viewport(390, 844);
+  Ui.Visit("/inbox/mine/i/" + item);
+  Assert.Visible("proposes: Move orders to next month");
+  Assert.NoOverflow();
+  Ui.Shot("response-inbox-revised-plan-phone-light");
+  Ui.Theme("dark");
+  Ui.Shot("response-inbox-revised-plan-phone-dark");
+}
+
+/// ⭐ THE RUN PAGE, once every commitment is fulfilled or resolved: the way it went — out to carrying it out, back
+/// to planning when the stock fell short, and out again — and what happened at each step.
+[Test(Plant)]
+void the_run_page_of_a_response_shows_it_planning_again() {
+  var disruption = TheResponseToThePlan();
+  TheResponseFromThePlan(disruption);
+  Guid run = Guid.Empty;
+  Guid work = Guid.Empty;
+  runas (Astrid) {
+    run = ProcessRunAbout("DisruptionResponse", disruption)!.Id;
+    work = AgentTask.Single(t => t.RunItem == disruption && t.RunState == "Assessing" && t.Parent == null).Id;
+  }
+
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Astrid);
+  Ui.Visit("/responses");
+  Assert.Visible("Brask Castings has shut down", within: "Runs");
+  Ui.Click("Brask Castings has shut down");
+  Assert.Visible("Brask Castings has shut down", within: "Where it stands");
+  Assert.Visible("Finished", within: "Where it stands");
+  Assert.Visible("11 days", within: "In figures");
+  Assert.Visible("1 of the regions could not be assessed by the agents, so each one's lead is asked what it needs.", within: "State 1, Assessing what is at risk");
+  Assert.Visible("The app itself answered the stock changed step.", within: "State 4, Carrying it out");
+  Assert.Visible("Asked Astrid Holm: “Housings in the Malmö warehouse: more is held than there is. Who gives way?”", within: "State 5, Planning again");
+  Assert.NoOverflow();
+  Ui.Shot("response-run-wide-light");
+  Ui.Theme("dark");
+  Ui.Shot("response-run-wide-dark");
+  Ui.Theme("light");
+
+  Ui.Viewport(390, 844);
+  Ui.Visit("/responses/" + run);
+  Assert.Visible("Brask Castings has shut down", within: "Where it stands");
+  Assert.NoOverflow();
+  Ui.Shot("response-run-phone-light");
+  Ui.Theme("dark");
+  Ui.Shot("response-run-phone-dark");
+  Ui.Theme("light");
+
+  // The coordinator's assessment, opened: the four pieces it handed on, and the one that was stopped.
+  Ui.Viewport(1440, 900);
+  Ui.Visit("/work/" + work + "/0");
+  Assert.Visible("What is at risk: Brask Castings has shut down");
+  Assert.Visible("Stopped", within: "Handed on");
+  Assert.NoOverflow();
+  Ui.Shot("response-work-wide-light");
+}

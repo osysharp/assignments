@@ -1,0 +1,36 @@
+// The producer's test project for Osysharp.Assignments.Allocations — a pump maker whose supplier of housings shuts
+// down. The response is one job with a job under it for each sales region; the regions draw on one warehouse's stock,
+// which is a shared pool: one region's plan is refused because another already holds what it asked for, one waits its
+// turn, and when a count finds less than was thought the operations director decides who gives way and that region
+// plans again. Agents assess and plan; people approve; a foundry outside answers through a link. No model is ever
+// called: its one model is scripted.
+app Pumpworks {
+  model "model/**/*.osy";
+  tests "**/*.test.osy";
+  use Osysharp.Assignments@1;
+  use Osysharp.Assignments.Allocations@1;
+  use Osysharp.Assignments.Agents@1;
+  use Osysharp.Assignments.WorkQueues@1;
+  use Osysharp.HumanRequests@1;
+  use Osysharp.HumanRequests.Processes@1;
+  use Osysharp.Processes@1;
+  use Osysharp.Agents@1;
+  use Osysharp.Agents.Testing@1;
+  use Osysharp.Agents.HumanRequests@1;
+  use Osysharp.Agents.Inspector@1;
+  use Osysharp.Agents.Processes@1;
+  use Osysharp.WorkRepositories@1;
+  use Osysharp.WorkRepositories.Agents@1;
+  use Osysharp.WorkQueues@1;
+  use Osysharp.Llm@2;
+  use Osysharp.Identity@0;
+  use Osysharp.Organizations@0;
+  use Osysharp.Organizations.ServicePlans@0;
+  use Osysharp.Presence@0;
+  use Osysharp.Observability;
+  use Osysharp.Workflow;
+  use Osysharp.ServiceHours;
+  use Osysharp.Storage;
+  use Osysharp.Diagrams@0;
+  use Osysharp.Ui;
+}
