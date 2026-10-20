@@ -1,0 +1,82 @@
+// On screen: who an assignment is waiting on, on the assignment's page; and which assignment a request is part of, on
+// the request's item in the inbox.
+namespace Osysharp.Assignments.WorkQueues;
+
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Assignments;
+using Osysharp.Ui;
+
+/// The ids of an assignment's open requests, as whoever is looking may read its work. Empty: none, or not theirs.
+[Server, Authorize(IsAuthenticated)]
+public List<Guid> AssignmentRequestIds(Guid assignment) {
+  var a = Assignment.FirstOrDefault(x => x.Id == assignment);
+  if (a == null) { return []; }
+  return OpenRequestIds(a!);
+}
+
+/// ⭐ WHO AN ASSIGNMENT IS WAITING ON — drawn on every assignment's page (`AssignmentView`): each open request, of
+/// whom, since when, and whether it is late. Empty, it says so.
+[Contribution("Waiting on people")]
+component RequestsOnTheAssignment(Guid assignment) : AssignmentPanel {
+  List<Guid> ids = [];
+  bool loaded = false;
+  on mount {
+    ids = AssignmentRequestIds(assignment);
+    loaded = true;
+  }
+  render {
+    if (!loaded) { Stack(gap: 2, label: "Waiting on people") { Skeleton(); Skeleton(SkeletonShape.HalfLine); } }
+    if (loaded) { WaitingOnPeople(requests: ids); }
+  }
+}
+
+/// The assignment a request is part of, for the request's item.
+public class AssignmentTag {
+  public Guid Id;
+  public string Title = "";
+  public string Goal = "";
+  /// How far it is: "2 of 3 met".
+  public string Progress = "";
+  public bool Open = true;
+  public string State = "";
+}
+
+/// The assignment a request is part of, as whoever is looking may read it. Null: none — or not theirs to read, as
+/// for a customer who is asked something and is not on the job.
+[Server, Authorize(IsAuthenticated)]
+public AssignmentTag? AssignmentTagOf(Guid request) {
+  var work = AssignmentWork.FirstOrDefault(w => w.SubjectType == RequestWork && w.Subject == request);
+  if (work == null) { return null; }
+  var a = work!.Assignment;
+  var met = a.Criteria.Count(c => c.State != CriterionState.Unmet);
+  return new AssignmentTag {
+    Id = a.Id, Title = a.Title, Goal = a.Goal, Progress = met.ToString() + " of " + a.Criteria.Count.ToString() + " met",
+    Open = a.State == AssignmentState.Open, State = a.State.Label,
+  };
+}
+
+/// ⭐ WHICH ASSIGNMENT A REQUEST IS PART OF — drawn above the request on its item in the inbox, for whoever may read
+/// the assignment: its title, the outcome wanted, and how far it is. Nothing for anybody else.
+[Contribution("Assignment")]
+component AssignmentOnARequest(HumanRequest item) : WorkItemDetail<HumanRequest> {
+  AssignmentTag? tag = null;
+  on mount { try { tag = AssignmentTagOf(item.Id); } catch (Exception ex) { tag = null; } }
+  render {
+    if (tag != null) {
+      Row(gap: 3, px: 5, pt: 4, align: Align.Start, label: "Part of an assignment") {
+        Box(pt: 1) { Icon(Icons.Folder, size: 14, color: Colors.TextMuted); }
+        Stack(gap: 1, minW: "0") {
+          Row(gap: 2, align: Align.Center, wrap: Wrapping.Wrap) {
+            Text("Part of", fontSize: FontSize.Label, color: Colors.TextMuted);
+            Text(tag.Title, fontSize: FontSize.Label, fontWeight: FontWeight.Semibold);
+            if (tag.Open) { Badge(tag.Progress, tone: Tone.Ghost); }
+            if (!tag.Open) { Badge(tag.State, tone: Tone.Ghost); }
+          }
+          if (tag.Goal != "") { Text(tag.Goal, fontSize: FontSize.Label, color: Colors.TextSecondary, maxW: "62ch"); }
+        }
+      }
+    }
+  }
+}

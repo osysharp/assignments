@@ -1,0 +1,177 @@
+// A workshop that services machines: its people and its customers, a press and the job the workshop has open on it,
+// what the job asks of people, and the agent that reads the fault log.
+namespace Pressworks;
+
+using Osysharp.Identity;
+using Osysharp.Organizations;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Assignments;
+using Osysharp.Assignments.WorkQueues;
+using Osysharp.Assignments.Agents;
+using Osysharp.Agents;
+using Osysharp.Agents.HumanRequests;
+using Osysharp.Llm;
+using Osysharp.Workflow;
+using Osysharp.ServiceHours;
+
+[Role] enum ShopRole { Authenticator, Desk, Technician, Manager, Customer, Diagnostics, Coordination, Reading }
+
+partial entity RoleGrant { security { allow read when IsAuthenticated; } }
+
+policy IsDesk        => RoleGrant.Any(g => g.Member == user && g.Role == ShopRole.Desk);
+policy IsTechnician  => RoleGrant.Any(g => g.Member == user && g.Role == ShopRole.Technician);
+policy IsManager     => RoleGrant.Any(g => g.Member == user && g.Role == ShopRole.Manager);
+policy IsCustomer    => RoleGrant.Any(g => g.Member == user && g.Role == ShopRole.Customer);
+policy IsDiagnostics => RoleGrant.Any(g => g.Member == user && g.Role == ShopRole.Diagnostics);
+policy IsStaff       => IsDesk || IsTechnician || IsManager;
+
+// Assignments: the desk opens jobs; the manager oversees them and accepts exceptions.
+policy OpensAssignments            => IsDesk || IsManager;
+policy OverseesAssignments         => IsManager;
+policy AcceptsAssignmentExceptions => IsManager;
+// The inbox: staff work it — and a customer has one too, for what the workshop asks of them; the manager leads it.
+policy WorksInbox       => IsStaff || IsCustomer || IsAnAgent;
+policy LeadsInbox       => IsManager;
+policy AdministersInbox => IsManager;
+policy ManagesOrganizations  => IsManager;
+policy CollaboratesOnRecords => IsStaff;
+// Requests: staff put them; the manager oversees them.
+policy AsksPeople       => IsStaff;
+policy OverseesRequests => IsManager;
+// Agents: staff give the diagnoser work; the manager answers for it.
+policy UsesAgents       => IsStaff;
+policy SupervisesAgents => IsManager;
+policy AuditsAgents     => IsManager;
+policy ReadsModelUsage   => IsManager;
+policy ManagesModelSpend => IsManager;
+
+/// Somebody at the workshop, one of its customers — or the agent's own account.
+entity Person : Principal {
+  [MaxLength(200)] string CodeHash = "";
+  security {
+    allow read when IsAuthenticated || IsAuthenticator;
+    allow create when IsAuthenticator;
+    deny read CodeHash when !IsAuthenticator;
+  }
+}
+
+partial entity ServiceHours { security { allow read when IsStaff; allow create, update, delete when IsManager; } }
+partial entity ServiceWindow { security { allow read when IsStaff; allow create, update, delete when IsManager; } }
+partial entity ServiceException { security { allow read when IsStaff; allow create, update, delete when IsManager; } }
+partial entity WorkItem { security { allow read when IsStaff || IsCustomer || IsAnAgent; } }
+
+/// A machine the workshop looks after.
+entity Machine {
+  [Required, Unique, MaxLength(60)] string Serial;
+  [MaxLength(2000)] string FaultLog = "";
+  /// The part on order for it, and how many times one was ordered.
+  [MaxLength(80)] string PartOnOrder = "";
+  int PartsOrdered = 0;
+  security { allow read, create, update when IsStaff || IsAnAgent; }
+}
+
+/// What a repair will cost, as it is put to the customer.
+entity RepairQuote {
+  [Required] Assignment Job;
+  decimal Amount;
+  int Revision = 1;
+  security { allow read, create, update when IsStaff; }
+}
+
+// ── the job ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Open the job for a press that faults — with the technician and the diagnoser's own account on it.
+public Assignment OpenRepair(Machine machine, Person technician) {
+  return OpenAssignment(new NewAssignment {
+    Title = "Press " + machine.Serial + " faults intermittently",
+    Goal = "The press runs a full shift without faulting.",
+    Criteria = ["The cause is found", "The customer approved the cost", "The press ran clean for a shift"],
+    Assignees = [technician, Agents.Of<Diagnoser>().Actor],
+  });
+}
+
+/// Put the cost to the customer: an approval of this quote as it stands, attached to the job.
+public HumanRequest AskCustomerToApprove(Assignment job, Person customer, decimal amount, TimeSpan? within = null, TimeSpan? expireAfter = null) {
+  var quote = new RepairQuote { Job = job, Amount = amount };
+  return AssignmentRequests.Ask(job, new NewRequest {
+    Kind = RequestKind.Approval, To = customer, Title = "Approve the cost of the repair?",
+    Context = "A pilot valve and four hours on site.",
+    Facts = [new RequestFact("Cost", amount.ToString("0.00") + " EUR")],
+    About = Subject.Of("RepairQuote", quote.Id, "The quote for the press", version: "r" + quote.Revision.ToString()),
+    Within = within, ExpireAfter = expireAfter,
+  }, key: "quote");
+}
+
+/// Ask the technician when he can be on site.
+public HumanRequest AskForAVisit(Assignment job, Person technician) {
+  return AssignmentRequests.Ask(job, new NewRequest {
+    Kind = RequestKind.Question, To = technician, Title = "When can you be on site?",
+    Options = [RequestOption.Of("This week"), RequestOption.Of("Next week")],
+  }, key: "visit");
+}
+
+// ── the diagnoser ───────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// What a machine's controller logged.
+[Action("Read the fault log", Query)]
+public string ReadFaultLog(Machine machine) { return machine.FaultLog; }
+
+/// Order a part for a machine.
+[Action("Order a part")]
+public string OrderPart(Machine machine, string part) {
+  machine.PartOnOrder = part;
+  machine.PartsOrdered = machine.PartsOrdered + 1;
+  return $"{part} is on order for {machine.Serial}.";
+}
+
+/// What the diagnoser hands back.
+public class Diagnosis {
+  /// What is wrong, in a sentence.
+  public string Cause = "";
+}
+
+/// Finds out why a press faults.
+public class DiagnosePress : Skill<Machine, Diagnosis> {
+  public override string Description => "Find out why the press faults, and order what it needs.";
+  public override List<ActionInfo> Tools => [Actions.Of(ReadFaultLog), Actions.Of(OrderPart)];
+  public override string Brief(Machine m) => $"Press {m.Serial}. Its id is {m.Id}.";
+  public override string Names(string action, string argument, string value) {
+    if (argument != "machine") { return value; }
+    var m = Machine.FirstOrDefault(x => x.Id == Guid.Parse(value));
+    return m == null ? value : "Press " + m!.Serial;
+  }
+}
+
+/// Reads fault logs. It says nothing about what it may do alone: it reads by itself, and proposes an order.
+[Actor(Roles = [ShopRole.Diagnostics])]
+public class Diagnoser : Agent {
+  public static Person Principal => new Person { Email = "diagnoser@pressworks.example", DisplayName = "Diagnoser" };
+  public override string Purpose => "You find out why a machine faults.";
+  public override List<SkillBase> Skills => [new DiagnosePress(), new ReadTheLog()];
+}
+
+/// Have the diagnoser look at the press, for the job.
+public AgentOutcome<Diagnosis> Diagnose(Assignment job, Machine machine) {
+  return await AssignedWork.Do(job, Agents.Of<Diagnoser>(), new DiagnosePress(), machine, key: "diagnosis", about: "Diagnose press " + machine.Serial);
+}
+
+// ── what the workshop hears ─────────────────────────────────────────────────────────────────────────────────────────
+
+entity Heard {
+  [Required, MaxLength(40)] string What;
+  [MaxLength(4000)] string About = "";
+  security { allow read, create when IsAuthenticated || IsAnonymous; }
+}
+
+[AuthMethod]
+string SignInWithCode(string email, string code) {
+  var p = Person.FirstOrDefault(x => x.Email == NormalisedEmail(email));
+  if (p == null || !p.IsActive) { Security.VerifyPassword(code); return ""; }
+  if (!Security.VerifyPassword(code, p.CodeHash)) { return ""; }
+  return Security.IssueJwt(p.Id, p.Email);
+}
+
+app.AuthBootstrap = new AuthBootstrap { Role = ShopRole.Authenticator, Login = SignInWithCode };
+app.Auth = new PasswordAuth { LoginField = Email, PasswordField = CodeHash };
+app.Audit = new AuditConfig { Redact = new AuditRedaction { Properties = [Pressworks.Person.CodeHash] } };

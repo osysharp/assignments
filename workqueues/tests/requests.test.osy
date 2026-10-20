@@ -1,0 +1,209 @@
+// Osysharp.Assignments.WorkQueues — what a job asks of people is in their inboxes and on the job: every open request
+// is a piece of the job's work, an answer closes that work and completes nothing, and what the diagnoser proposes
+// while it works for the job is the job's too.
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Assignments;
+using Osysharp.Assignments.WorkQueues;
+using Osysharp.Assignments.Agents;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Workflow;
+using Pressworks;
+
+/// The queue's half of "unfinished work stays visible": an assignment's open requests as items in the inbox of
+/// whoever each waits on, and the audit trail naming every one.
+[Test(Floor)]
+void the_queue_and_the_audit_show_every_unresolved_item() {
+  var job = OpenPressJob();
+  runas (Dana) {
+    AskCustomerToApprove(JobBy(job), Carl, 480m);
+    AskForAVisit(JobBy(job), Tariq);
+  }
+  Background.Settle();
+  // The customer finds the request waiting for him in his inbox, without being on the job…
+  runas (Carl) {
+    var mine = Requests.Mine();
+    Assert.Equal(["Approve the cost of the repair?"], mine.Select(r => r.Title).ToList());
+    Assert.Equal("Press P-200 faults intermittently", mine[0].WaitingLabel);
+    // …and the job itself is not his to read.
+    Assert.Equal(0, Assignment.Count());
+    Assert.Null(AssignmentTagOf(mine[0].Id));
+  }
+  // The technician finds his, and — being on the job — which job it is part of.
+  runas (Tariq) {
+    var mine = Requests.Mine().Single();
+    Assert.Equal("When can you be on site?", mine.Title);
+    var tag = AssignmentTagOf(mine.Id)!;
+    Assert.Equal("Press P-200 faults intermittently", tag.Title);
+    Assert.Equal("0 of 3 met", tag.Progress);
+  }
+  // The manager, who oversees every job, sees both on the job: as open work, with who each waits on — and on its trail.
+  runas (Mona) {
+    var a = JobBy(job);
+    var open = AssignmentWork.Where(w => w.Assignment == a && w.State == WorkState.Open).OrderBy(w => w.Number).ToList();
+    Assert.Equal(["Approve the cost of the repair?", "When can you be on site?"], open.Select(w => w.Title).ToList());
+    Assert.Equal(["Carl Lind", "Tariq Aziz"], open.Select(w => w.WaitingOn!.DisplayName).ToList());
+    Assert.Equal(["their approval", "their answer"], open.Select(w => w.WaitingFor).ToList());
+    Assert.Equal(WorkKind.Request, open[0].Kind);
+    Assert.Equal(["Carl Lind", "Tariq Aziz"], ConditionsOf(a).NextStepWith);
+    Assert.Equal(2, AssignmentRequests.Open(a).Count);
+    Assert.Equal(2, AssignmentRequestIds(job).Count);
+    var trail = ActivityOf(a).Select(l => l.Said).ToList();
+    Assert.Contains("Request: Approve the cost of the repair?", trail);
+    Assert.Contains("Request: When can you be on site?", trail);
+    Assert.Equal(job, AssignmentRequests.Of(Requests.WaitedOnBy("Assignment", job)[0])!.Id);
+  }
+}
+
+[Test(Floor)]
+void an_answer_closes_the_work_and_completes_nothing() {
+  var job = OpenPressJob();
+  runas (Dana) { AskCustomerToApprove(JobBy(job), Carl, 480m); AskForAVisit(JobBy(job), Tariq); }
+  Background.Settle();
+  runas (Carl) { AnswerRequest(Requests.Mine().Single(), RequestAnswer.Approve()); }
+  runas (Tariq) { AnswerRequest(Requests.Mine().Single(), RequestAnswer.Choose("next-week")); }
+  Background.Settle();
+  runas (Mona) {
+    var a = JobBy(job);
+    var work = AssignmentWork.Where(w => w.Assignment == a).OrderBy(w => w.Number).ToList();
+    Assert.Equal([WorkState.Done, WorkState.Done], work.Select(w => w.State).ToList());
+    Assert.Equal("Approved by Carl Lind.", work[0].Result);
+    Assert.Equal("Answered by Tariq Aziz.", work[1].Result);
+    Assert.Equal(0, AssignmentRequests.Open(a).Count);
+    // No request is open now — and nothing is done either: what done means is the criteria, and none is met.
+    Assert.Equal(AssignmentState.Open, a.State);
+    Assert.Equal(3, a.Criteria.Count(c => c.State == CriterionState.Unmet));
+    Assert.Throws<CriteriaUnmet>(() => CompleteAssignment(a, "The customer approved."));
+  }
+}
+
+[Test(Floor)]
+void a_request_called_off_or_out_of_time_closes_its_work_and_waives_nothing() {
+  TestClock.Set(new DateTime(2031, 5, 5, 8, 0, 0, DateTimeKind.Utc));
+  var job = OpenPressJob();
+  Guid quote = Guid.Empty;
+  Guid visit = Guid.Empty;
+  runas (Dana) {
+    var q = AskCustomerToApprove(JobBy(job), Carl, 480m, TimeSpan.FromHours(8), TimeSpan.FromDays(10));
+    var v = AskForAVisit(JobBy(job), Tariq);
+    Workflow.Settle(q);
+    Workflow.Settle(v);
+    quote = q.Id;
+    visit = v.Id;
+  }
+  Background.Settle();
+  // A day on, the customer's answer is late. It still waits — and the job's trail says the date passed.
+  TestClock.Advance(TimeSpan.FromDays(1));
+  Background.Settle();
+  runas (Mona) {
+    Workflow.Settle(HumanRequest.Single(r => r.Id == quote));
+    Background.Settle();
+    var a = JobBy(job);
+    Assert.Equal(WorkState.Open, AssignmentWork.Single(w => w.Subject == quote).State);
+    Assert.Contains("Approve the cost of the repair?: its date passed with no answer. It still waits.", ActivityOf(a).Select(l => l.Said).ToList());
+    // The manager calls the visit question off.
+    CancelRequest(HumanRequest.Single(r => r.Id == visit), "The site is closed this month.");
+    Workflow.Settle(HumanRequest.Single(r => r.Id == visit));
+  }
+  // Ten days on, the approval has run out of time.
+  TestClock.Advance(TimeSpan.FromDays(10));
+  Background.Settle();
+  runas (Mona) {
+    Workflow.Settle(HumanRequest.Single(r => r.Id == quote));
+    Background.Settle();
+    var a = JobBy(job);
+    var q = AssignmentWork.Single(w => w.Subject == quote);
+    Assert.Equal(WorkState.Failed, q.State);
+    Assert.Equal("Nobody answered in the time it could wait.", q.Result);
+    var v = AssignmentWork.Single(w => w.Subject == visit);
+    Assert.Equal(WorkState.Cancelled, v.State);
+    Assert.Equal("The request was called off: The site is closed this month.", v.Result);
+    // Running out of time approved nothing.
+    Assert.Equal(CriterionState.Unmet, a.Criteria.Single(c => c.Position == 2).State);
+    Assert.Equal(AssignmentState.Open, a.State);
+  }
+}
+
+[Test(Floor)]
+void asking_again_under_the_same_key_puts_nothing_twice() {
+  var job = OpenPressJob();
+  runas (Dana) {
+    var first = AskForAVisit(JobBy(job), Tariq);
+    UnitOfWork.Commit();
+    var again = AskForAVisit(JobBy(job), Tariq);
+    Assert.Equal(first.Id, again.Id);
+    Assert.Equal(1, HumanRequest.Count());
+  }
+  runas (Mona) { Assert.Equal(1, AssignmentWork.Count(w => w.Kind == WorkKind.Request)); }
+}
+
+// ── what an agent asks while it works for the job ───────────────────────────────────────────────────────────────────
+
+[Test(Floor)]
+void what_an_agent_proposes_while_working_for_an_assignment_is_the_assignments_too() {
+  var job = OpenPressJob();
+  Guid task = Guid.Empty;
+  // Tariq has the diagnoser look at the press, for the job. It reads the log by itself — and proposes to order a part.
+  runas (Tariq) {
+    var press = Press();
+    var script = AgentScript.Of(
+      Says.Tool(Actions.Of(ReadFaultLog), MachineArg(press)),
+      Says.Tool("E41 fourteen times: the pilot valve is worn.", Actions.Of(OrderPart), PartArgs(press, "Pilot valve PV-3")),
+      Says.HandBack(new Diagnosis { Cause = "A worn pilot valve." }));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    var outcome = Diagnose(JobBy(job), press);
+    Assert.True(outcome.Waiting);
+    task = outcome.Task;
+  }
+  Background.Settle();
+  runas (Mona) {
+    var a = JobBy(job);
+    // The agent's work is still attached and open — it has not ended — and its proposal is a piece of the job's work
+    // of its own, waiting on Tariq, in his inbox.
+    var open = AssignmentWork.Where(w => w.Assignment == a && w.State == WorkState.Open).OrderBy(w => w.Number).ToList();
+    Assert.Equal(["Diagnose press P-200", "Diagnoser proposes: Order a part"], open.Select(w => w.Title).ToList());
+    Assert.Equal([WorkKind.AgentTask, WorkKind.Request], open.Select(w => w.Kind).ToList());
+    Assert.Equal("Tariq Aziz", open[1].WaitingOn!.DisplayName);
+    Assert.Equal("their approval", open[1].WaitingFor);
+    Assert.Equal(0, Press().PartsOrdered);
+  }
+  runas (Tariq) {
+    var mine = Requests.Mine().Single();
+    Assert.Equal("Diagnoser proposes: Order a part", mine.Title);
+    Assert.Equal("Press P-200 faults intermittently", AssignmentTagOf(mine.Id)!.Title);
+    AnswerRequest(mine, RequestAnswer.Approve());
+    Background.Settle();
+    Workflow.Settle(AgentWait.Single());
+    Background.Settle();
+  }
+  runas (Mona) {
+    var a = JobBy(job);
+    // His yes ordered the part, once; the request's work is done; the agent went on and finished, and so is its work.
+    Assert.Equal(1, Press().PartsOrdered);
+    Assert.Equal("Pilot valve PV-3", Press().PartOnOrder);
+    var work = AssignmentWork.Where(w => w.Assignment == a).OrderBy(w => w.Number).ToList();
+    Assert.Equal([WorkState.Done, WorkState.Done], work.Select(w => w.State).ToList());
+    Assert.Equal("Diagnoser finished it.", work[0].Result);
+    Assert.Equal("Approved by Tariq Aziz.", work[1].Result);
+    Assert.Equal(AgentTaskStatus.Done, AgentTask.Single(t => t.Id == task).Status);
+    // What the work spent is on the job.
+    Assert.True(CostOf(a).TotalMicros > 0);
+  }
+}
+
+/// A job that is closed asks nothing more of anybody: the request is refused where it is put — and nothing reaches
+/// an inbox with no work behind it.
+[Test(Floor)]
+void nothing_more_is_asked_for_a_job_that_is_closed() {
+  var job = OpenPressJob();
+  runas (Mona) {
+    CancelAssignment(JobBy(job), "The customer scrapped the press.");
+    Assert.Throws<AssignmentClosed>(() => AskForAVisit(JobBy(job), Tariq));
+    Assert.Equal(0, HumanRequest.Count());
+  }
+  Background.Settle();
+  runas (Tariq) { Assert.Equal(0, Requests.Mine().Count); }
+}

@@ -1,0 +1,80 @@
+// Osysharp.Assignments.WorkQueues — on screen, driven as a person: the job's page lists who it is waiting on, and the
+// request in the technician's inbox says which job it is part of. `osy test --pixels` photographs each (`Ui.Shot`).
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Assignments;
+using Osysharp.Assignments.WorkQueues;
+using Osysharp.Workflow;
+using Pressworks;
+
+[Test(Floor)]
+void the_jobs_page_lists_who_it_waits_on_and_the_inbox_item_says_which_job() {
+  var job = OpenPressJob();
+  Guid visit = Guid.Empty;
+  runas (Dana) {
+    var q = AskCustomerToApprove(JobBy(job), Carl, 480m);
+    var v = AskForAVisit(JobBy(job), Tariq);
+    Workflow.Settle(q);
+    Workflow.Settle(v);
+    visit = v.Id;
+  }
+  Background.Settle();
+
+  // The manager opens the job: under the assignment's own page, who it is waiting on.
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Mona);
+  Ui.Visit("/jobs/" + job);
+  Assert.Visible("Press P-200 faults intermittently");
+  Assert.Visible("Approve the cost of the repair?", within: "Waiting on people");
+  Assert.Visible("When can you be on site?", within: "Waiting on people");
+  Assert.Visible("Carl Lind", within: "Waiting on people");
+  Assert.NoOverflow();
+  Ui.Shot("job-waiting-wide-light");
+  Ui.Theme("dark");
+  Ui.Shot("job-waiting-wide-dark");
+  Ui.Theme("light");
+
+  // The technician opens his item: it says which job it is part of, and how far that job is.
+  Ui.SignInAs(Tariq);
+  Ui.Visit("/inbox/mine/i/" + visit);
+  Assert.Visible("Press P-200 faults intermittently", within: "Part of an assignment");
+  Assert.Visible("0 of 3 met", within: "Part of an assignment");
+  Assert.Visible("The press runs a full shift without faulting.", within: "Part of an assignment");
+  Assert.NoOverflow();
+  Ui.Shot("request-of-a-job-wide-light");
+  Ui.Click("Next week");
+  Assert.Visible("Next week", within: "Answer");
+  Background.Settle();
+
+  Ui.Viewport(390, 844);
+  Ui.Visit("/inbox/mine/i/" + visit);
+  Assert.Visible("Press P-200 faults intermittently", within: "Part of an assignment");
+  Assert.NoOverflow();
+  Ui.Shot("request-of-a-job-phone-light");
+
+  // The customer's item says nothing of the job: it is not his to read.
+  Ui.SignInAs(Carl);
+  Ui.Visit("/inbox/mine");
+  Assert.Visible("Approve the cost of the repair?", within: "Mine list");
+  runas (Carl) {
+    var mine = Requests.Mine().Single();
+    Assert.Null(AssignmentTagOf(mine.Id));
+  }
+
+  // With the visit answered, the job waits on one person.
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Mona);
+  Ui.Visit("/jobs/" + job);
+  Assert.Visible("Approve the cost of the repair?", within: "Waiting on people");
+  Assert.Visible("“When can you be on site?” is done: Answered by Tariq Aziz.");
+}
+
+/// The door into the works: the right code signs a person in, and a wrong code or an unknown address answers the
+/// same nothing.
+[Test(Floor)]
+void signing_in_takes_the_right_code_and_nothing_else() {
+  Assert.NotEqual("", SignInWithCode("dana@pressworks.example", "1111"));
+  Assert.Equal("", SignInWithCode("dana@pressworks.example", "9999"));
+  Assert.Equal("", SignInWithCode("nobody@pressworks.example", "1111"));
+}

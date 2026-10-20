@@ -1,0 +1,544 @@
+// ⭐ ONE REPAIR, WALKED FROM END TO END over three weeks in March — the owner's "equipment diagnosis and repair" case.
+//
+//   Mon  3 Mar  Carl, at the foundry, reports that press P-200 faults now and then. The desk opens the job. The
+//               service coordinator has the log, the history and the manual read — three specialists at once; the
+//               manual's reader runs out of its allowance — writes down what it concludes, and asks for readings.
+//   Wed  5 Mar  Carl's operator fills in the form. Tariq is asked to inspect on site.
+//   Thu  6 Mar  Tariq has not answered — he is at another customer's. The request goes on to Ines.
+//   Fri  7 Mar  Ines inspects: the pilot valve's seat is scored. The parts supplier is asked through a link.
+//   Mon 10 Mar  The supplier answers. The coordinator proposes to order a whole valve block; Mona, the manager, says
+//               no; it proposes the pilot valve alone; she says yes, and the part is ordered as her. The cost goes to Carl.
+//   Tue 11 Mar  Carl approves. Ines is asked to fit the part.
+//   Thu 13 Mar  Fitted, two hours clean on test. That closes nothing: Carl is asked how the first shift goes.
+//   Mon 17 Mar  It faulted three times. The SAME job looks into it again: its cause and its cost are back in
+//               question. The coordinator's model does not answer — twice — and the process hands the finding to Mona.
+//   Tue 18 Mar  Mona reads what the job holds and finds it: the sensor's cable chafes on the guard that was refitted
+//               in 2030. The coordinator plans again, with all the job holds; she approves a cable; Carl is asked.
+//   Wed 19 Mar  Carl approves the second quote.
+//   Fri 21 Mar  Ines fits the cable.
+//   Mon 24 Mar  A whole shift clean: the last thing "done" means is shown by the customer, and the job is closed.
+//
+// Then it is read back: by the manager, who sees everything and what it cost; by the technician, who sees the job
+// and not the money; by the customer, who sees what was asked of him and nothing of the workshop's own; and by the
+// supplier's link, which opens one request and nothing else.
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Assignments;
+using Osysharp.Assignments.WorkQueues;
+using Osysharp.Assignments.Agents;
+using Osysharp.WorkRepositories;
+using Osysharp.WorkRepositories.Agents;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Agents.HumanRequests;
+using Osysharp.Agents.Inspector;
+using Osysharp.Agents.Processes;
+using Osysharp.Processes;
+using Osysharp.Workflow;
+using Pressworks;
+
+Repair TheRepair(Guid id) { return Repair.Single(r => r.Id == id); }
+
+string FindingArgs(Repair r, string title, string content, string source) {
+  return "{\"assignment\":\"" + r.Job.Id.ToString() + "\",\"title\":\"" + title + "\",\"content\":\"" + content + "\",\"source\":\"" + source + "\"}";
+}
+string JobArg(Repair r) { return "{\"assignment\":\"" + r.Job.Id.ToString() + "\"}"; }
+
+/// ⭐ WHAT EACH MODEL SAYS. The coordinator hands the three readings on in one turn, writes down what it concludes
+/// and asks for readings; planning, it proposes a whole valve block, and — told no — the pilot valve alone. On the
+/// second look it reads what the job holds first, and proposes the cable.
+AgentCast TheWorkshopsAgents(Repair r) {
+  var machine = Says.Row(r.Machine.Id);
+  var arg = MachineArg(r.Machine);
+  var second = r.Round > 1;
+  var plan = second
+    ? AgentScript.Of(
+        Says.Tool(Actions.Of(ListItems), JobArg(r)),
+        Says.Tool("The manager found the sensor's cable chafing on the guard. A cable cures that; the valve is new.", Actions.Of(OrderPart), PartArgs(r.Machine, "sensor cable")),
+        Says.HandBack(new RepairPlan { Part = "sensor cable", Hours = 2, Cost = 230 }))
+    : AgentScript.Of(
+        Says.Tool("The pilot valve's seat is scored. A new valve block replaces the valve and its seals in one visit.", Actions.Of(OrderPart), PartArgs(r.Machine, "valve block assembly")),
+        Says.Tool("The block is sound, so the pilot valve alone: in stock at Hydra Parts, two days.", Actions.Of(OrderPart), PartArgs(r.Machine, "pilot valve")),
+        Says.HandBack(new RepairPlan { Part = "pilot valve", Hours = 4, Cost = 520 }));
+  return AgentCast.Of()
+    .PlaysAbout<ServiceCoordinator>("Find out why the press faults", AgentScript.Of(
+      Says.Together(
+        Says.HandTo<Diagnoser>(new ReadTheLog(), machine),
+        Says.HandTo<HistoryReader>(new ReadTheHistory(), machine),
+        Says.HandTo<ManualReader>(new ReadTheManual(), machine)),
+      Says.Tool(Actions.Of(RecordFinding), FindingArgs(r, "E41 points at the pilot circuit",
+        "E41, pilot pressure low, 14 times since March, clears on restart. Nothing in the service history touches the pilot circuit. The manual was not read: its reader ran out of its allowance.",
+        "The fault log and the service history")),
+      Says.HandBack(new FaultFinding { Cause = "Pilot pressure drops: most likely the pilot valve.", Part = "pilot valve", NeedsReadings = true })))
+    .PlaysAbout<ServiceCoordinator>("Plan the repair", plan)
+    .Plays<Diagnoser>(AgentScript.Of(
+      Says.Tool(Actions.Of(ReadFaultLog), arg),
+      Says.HandBack(new LogFinding { Code = "E41", Says = "Pilot pressure low, 14 times since March. Clears on restart." })))
+    .Plays<HistoryReader>(AgentScript.Of(
+      Says.Tool(Actions.Of(ServiceHistory), arg),
+      Says.HandBack(new HistoryFinding { Says = "Oil and filters in 2029; a guard refitted in 2030. Nothing on the pilot circuit." })))
+    // The manual is a long read: one answer of 1000 tokens in and 600 out costs 4000 of the reader's 6000.
+    .Plays<ManualReader>(AgentScript.Of(
+      Says.Tool(Actions.Of(ReadFaultLog), arg, 1000, 600),
+      Says.Tool(Actions.Of(ManualOn), "{\"code\":\"E41\"}"),
+      Says.HandBack(new ManualFinding { Says = "Check the pilot valve seat, then the sensor and its cable." })));
+}
+
+/// The agents answer as scripted — or, with `coordinatorDown`, the coordinator's model cannot be reached when it is
+/// asked to look into the fault. The script is made when a model is asked, from the repair as it stands then: the
+/// agent whose model it is reads the one repair there is.
+void TheAgentsAnswer(bool coordinatorDown = false) {
+  ScriptedAnswer.Stub((model, request) => {
+    if (coordinatorDown && AgentCast.AskedAgent(request) == "ServiceCoordinator" && AgentCast.FirstAsked(request).Contains("The customer says:")) {
+      throw new ExternalServiceException("The model did not answer.");
+    }
+    return TheWorkshopsAgents(Repair.Single()).Answer(model, request);
+  });
+}
+
+/// Let whatever waits look again: an answered request is carried to what waited for it, the agent's piece goes on,
+/// and the repair's process follows.
+void LetItGoOn(Guid repair) {
+  for (var i = 0; i < 4; i++) {
+    Background.Settle();
+    runas (Mona) {
+      foreach (var wait in AgentWait.Where(w => w.Status == AgentWaitStatus.Waiting).ToList()) { Workflow.Settle(wait); }
+      foreach (var wait in AgentWorkWait.ToList()) { Workflow.Settle(wait); }
+      Workflow.Settle(Repair.Single(r => r.Id == repair));
+    }
+  }
+}
+
+/// The open request whose title starts with `title`, among those put to whoever is signed in.
+HumanRequest Mine(string title) { return Requests.Mine().Single(r => r.Title.StartsWith(title)); }
+
+RepairStage StageOf(Guid repair) { return Repair.Single(r => r.Id == repair).Stage; }
+
+/// The coordinator's piece of work for one step of the repair — the last attempt, when it was tried again.
+AgentTask CoordinatorsWork(Guid repair, string state) {
+  return AgentTask.Where(t => t.RunItem == repair && t.RunState == state && t.Parent == null).OrderByDescending(t => t.StartedAt).First();
+}
+
+/// ⭐ THE FIRST TEN DAYS: from Carl's report to the part fitted and the job closed on the technician's test run.
+/// Answers the repair's id.
+Guid TheFirstRepair() {
+  TestClock.Set(new DateTime(2031, 3, 3, 8, 0, 0, DateTimeKind.Utc));
+  Guid repair = Guid.Empty;
+  TheAgentsAnswer();
+  runas (Dana) {
+    var r = ReportFault(Press(), Carl, Tariq, Ines, "It stops with E41 two or three times a week, always after it has run a while.");
+    Workflow.Settle(r);
+    repair = r.Id;
+  }
+  LetItGoOn(repair);
+
+  // Wed 5 Mar: the customer's operator fills in the form.
+  TestClock.Advance(TimeSpan.FromDays(2));
+  runas (Carl) { AnswerRequest(Mine("Three readings"), RequestAnswer.Of(new PressureReadings { PilotBar = 38, MainBar = 210, WhenItFaults = "when it is warm, an hour or so in" })); }
+  LetItGoOn(repair);
+
+  // Thu 6 Mar: Tariq has not answered. Fri 7 Mar: Ines, to whom it went on, has been out.
+  TestClock.Advance(TimeSpan.FromDays(1));
+  LetItGoOn(repair);
+  TestClock.Advance(TimeSpan.FromDays(1));
+  runas (Ines) { AnswerRequest(Mine("Inspect the valve block"), RequestAnswer.Of(new InspectionReport { Found = "The pilot valve's seat is scored. The block itself is sound.", PartNeeded = true })); }
+  LetItGoOn(repair);
+
+  // Mon 10 Mar: the supplier answers through its link; the coordinator plans; Mona says no, then yes.
+  TestClock.Advance(TimeSpan.FromDays(3));
+  var link = "";
+  runas (Mona) { link = Heard.Single(h => h.What == "mailed").About; }
+  AnswerByLink(AnswerLink.From(link), new RequestAnswer { Values = new Dictionary<string, string> { ["InStock"] = "true", ["DeliveryDays"] = "2", ["Price"] = "140" } }, "Bo Ek");
+  LetItGoOn(repair);
+  runas (Mona) { AnswerRequest(Mine("Service coordinator proposes"), RequestAnswer.Reject("Not the whole block: Ines found the block sound. The pilot valve only.")); }
+  LetItGoOn(repair);
+  runas (Mona) { AnswerRequest(Mine("Service coordinator proposes"), RequestAnswer.Approve()); }
+  LetItGoOn(repair);
+
+  // Tue 11 Mar: Carl approves the cost. Thu 13 Mar: Ines fits the valve.
+  TestClock.Advance(TimeSpan.FromDays(1));
+  runas (Carl) { AnswerRequest(Mine("Approve the cost"), RequestAnswer.Approve()); }
+  LetItGoOn(repair);
+  TestClock.Advance(TimeSpan.FromDays(2));
+  runas (Ines) { AnswerRequest(Mine("Fit the pilot valve"), RequestAnswer.Of(new FittingReport { Done = "Pilot valve changed, seals renewed.", RanCleanOnTest = true })); }
+  LetItGoOn(repair);
+  return repair;
+}
+
+/// ⭐ …AND THE ELEVEN DAYS AFTER: the repair does not hold, the same job is opened again, the coordinator cannot be
+/// reached, the manager finds the cause by hand, and the second repair holds.
+void TheSecondRepair(Guid repair) {
+  // Mon 17 Mar: three faults in the first shift. The coordinator's model is down.
+  TestClock.Advance(TimeSpan.FromDays(4));
+  TheAgentsAnswer(coordinatorDown: true);
+  runas (Carl) { AnswerRequest(Mine("Did press P-200 run a shift clean?"), RequestAnswer.Of(new ShiftReport { RanClean = false, Faults = 3, Notes = "The same E41, about an hour into the shift." })); }
+  LetItGoOn(repair);
+
+  // Tue 18 Mar: Mona finds it by hand. The coordinator, back, plans with what the job holds; she approves the cable.
+  TestClock.Advance(TimeSpan.FromDays(1));
+  runas (Mona) {
+    FindByHand(TheRepair(repair), "The pilot pressure sensor's cable chafes on the guard that was refitted in 2030, and shorts when the press is warm. The valve was worn, and was not the cause.", "sensor cable");
+  }
+  TheAgentsAnswer();
+  LetItGoOn(repair);
+  runas (Mona) { AnswerRequest(Mine("Service coordinator proposes"), RequestAnswer.Approve()); }
+  LetItGoOn(repair);
+
+  // Wed 19 Mar: Carl approves the second quote. Fri 21 Mar: the cable is in. Mon 24 Mar: a whole shift clean.
+  TestClock.Advance(TimeSpan.FromDays(1));
+  runas (Carl) { AnswerRequest(Mine("Approve the cost"), RequestAnswer.Approve()); }
+  LetItGoOn(repair);
+  TestClock.Advance(TimeSpan.FromDays(2));
+  runas (Ines) { AnswerRequest(Mine("Fit the sensor cable"), RequestAnswer.Of(new FittingReport { Done = "New sensor cable, routed clear of the guard.", RanCleanOnTest = true })); }
+  LetItGoOn(repair);
+  TestClock.Advance(TimeSpan.FromDays(3));
+  runas (Carl) { AnswerRequest(Mine("Did press P-200 run a shift clean?"), RequestAnswer.Of(new ShiftReport { RanClean = true, Faults = 0 })); }
+  LetItGoOn(repair);
+}
+
+// ── the case ────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Floor)]
+void a_press_is_diagnosed_repaired_and_shown_to_run_and_the_same_job_is_opened_again_when_it_does_not() {
+  TestClock.Set(new DateTime(2031, 3, 3, 8, 0, 0, DateTimeKind.Utc));
+  Guid repair = Guid.Empty;
+
+  // ── Mon 3 Mar. The desk takes Carl's report; the coordinator looks into it. ──
+  TheAgentsAnswer();
+  runas (Dana) {
+    var r = ReportFault(Press(), Carl, Tariq, Ines, "It stops with E41 two or three times a week, always after it has run a while.");
+    Workflow.Settle(r);
+    repair = r.Id;
+  }
+  LetItGoOn(repair);
+  runas (Mona) {
+    var r = TheRepair(repair);
+    Assert.Equal(RepairStage.Measuring, r.Stage);
+    Assert.Equal("Pilot pressure drops: most likely the pilot valve.", r.Cause);
+    // Three readings went out at once. Two finished; the manual's reader ran out of its allowance, and the
+    // coordinator went on without it — and said so in what it wrote down.
+    var top = CoordinatorsWork(repair, "Investigating");
+    Assert.Equal([
+      "ServiceCoordinator · Investigate fault: Done",
+      "  Diagnoser · Read the log: Done",
+      "  HistoryReader · Read the history: Done",
+      "  ManualReader · Read the manual: Stopped",
+    ], Trajectory.Tree(top.Id));
+    var reader = AgentTask.Single(t => t.Agent == "Pressworks.ManualReader");
+    Assert.Equal(6000, reader.LimitMicros);
+    Assert.Equal(4000, reader.SpentMicros);
+    Assert.StartsWith("Its money ran out:", reader.Outcome);
+    // What it concluded is an item of the job, written by the coordinator's own account.
+    var finding = ItemsOf(r.Job, ItemKind.Finding).Single(i => i.Title == "E41 points at the pilot circuit");
+    Assert.Equal("E41 points at the pilot circuit", finding.Title);
+    Assert.Equal(Actor.Of<ServiceCoordinator>().Id, finding.AddedBy!.Id);
+    Assert.Contains("its reader ran out of its allowance", CurrentOf(finding).Content);
+    // The job waits on the customer, and says so.
+    Assert.Equal(["Carl Lind"], ConditionsOf(r.Job).NextStepWith);
+  }
+
+  // ── Wed 5 Mar. The operator's readings; the technician is asked to inspect. ──
+  TestClock.Advance(TimeSpan.FromDays(2));
+  runas (Carl) {
+    var form = Mine("Three readings");
+    Assert.Equal(RequestKind.Information, form.Asks);
+    Assert.Equal("Machine repair", form.AskedByName);
+    AnswerRequest(form, RequestAnswer.Of(new PressureReadings { PilotBar = 38, MainBar = 210, WhenItFaults = "when it is warm, an hour or so in" }));
+  }
+  LetItGoOn(repair);
+  runas (Tariq) {
+    Assert.Equal("", TheRepair(repair).Note);
+    Assert.Equal(RepairStage.Inspecting, StageOf(repair));
+    Assert.Equal("Inspect the valve block of press P-200", Requests.Mine().Single().Title);
+    Assert.Equal("Pilot 38 bar, main 210 bar. Faults when it is warm, an hour or so in.", CurrentOf(ItemOf(TheRepair(repair).Job, "readings-1")!).Content);
+  }
+
+  // ── Thu 6 Mar. He is at another customer's. A day on, the request goes on to whoever stands in. ──
+  TestClock.Advance(TimeSpan.FromDays(1));
+  LetItGoOn(repair);
+  runas (Ines) {
+    var mine = Requests.Mine().Single();
+    Assert.Equal("Inspect the valve block of press P-200", mine.Title);
+    Assert.Equal(Ines.Id, mine.EscalatedTo!.Id);
+    Assert.Equal(RequestStatus.Open, mine.Status);
+  }
+  runas (Mona) {
+    // The job's trail says the date passed and who it went on to; the job itself is overdue on that piece.
+    var said = ActivityOf(TheRepair(repair).Job).Select(l => l.Said).ToList();
+    Assert.True(said.Any(s => s.Contains("Inspect the valve block of press P-200") && s.Contains("Ines Falk")));
+  }
+
+  // ── Fri 7 Mar. Ines inspects. The supplier, who has no account, is sent a link. ──
+  TestClock.Advance(TimeSpan.FromDays(1));
+  runas (Ines) { AnswerRequest(Mine("Inspect the valve block"), RequestAnswer.Of(new InspectionReport { Found = "The pilot valve's seat is scored. The block itself is sound.", PartNeeded = true })); }
+  LetItGoOn(repair);
+  var link = "";
+  runas (Mona) {
+    var r = TheRepair(repair);
+    Assert.Equal(RepairStage.Sourcing, r.Stage);
+    Assert.Equal(Ines.Id, r.OnSite!.Id);
+    Assert.Equal("Ines Falk, on site", CurrentOf(ItemOf(r.Job, "inspection-1")!).From);
+    link = Heard.Single(h => h.What == "mailed").About;
+  }
+  // The link opens that one request, to whoever holds it — and nothing else of the workshop.
+  var seen = ViewByLink(AnswerLink.From(link));
+  Assert.Equal("Do you have a pilot valve for a P-series press?", seen.Title);
+  Assert.Equal(0, Assignment.Count());
+  Assert.Equal(0, Repair.Count());
+
+  // ── Mon 10 Mar. The supplier answers. The coordinator plans, and proposes an order. ──
+  TestClock.Advance(TimeSpan.FromDays(3));
+  var sent = AnswerByLink(AnswerLink.From(link), new RequestAnswer { Values = new Dictionary<string, string> { ["InStock"] = "true", ["DeliveryDays"] = "2", ["Price"] = "140" } }, "Bo Ek");
+  Assert.True(sent.Applied);
+  LetItGoOn(repair);
+  runas (Mona) {
+    var r = TheRepair(repair);
+    Assert.Equal(RepairStage.Planning, r.Stage);
+    Assert.Equal("In stock, 2 working days, 140.00 EUR.", CurrentOf(ItemOf(r.Job, "supplier-1")!).Content);
+    Assert.Equal("Bo Ek, through the link they were sent", CurrentOf(ItemOf(r.Job, "supplier-1")!).From);
+    // Nobody was named for this step: what the coordinator proposes is put to whoever answers for it.
+    var approval = Mine("Service coordinator proposes");
+    Assert.Equal("Service coordinator proposes: Order a part", approval.Title);
+    Assert.Equal("The pilot valve's seat is scored. A new valve block replaces the valve and its seals in one visit.", approval.Context);
+    var card = ProposalCardOf(AgentProposal.Single(p => p.Status == ProposalStatus.Waiting).Id)!;
+    Assert.Equal(["Press P-200", "valve block assembly"], card.Lines.Select(l => l.Value).ToList());
+    Assert.Equal("", Press().PartOnOrder);
+    // ⭐ She says no, and why. The reason reaches the coordinator, which proposes the smaller part.
+    AnswerRequest(approval, RequestAnswer.Reject("Not the whole block: Ines found the block sound. The pilot valve only."));
+  }
+  LetItGoOn(repair);
+  runas (Mona) {
+    Assert.Equal("", Press().PartOnOrder);
+    var again = Mine("Service coordinator proposes");
+    Assert.Equal("The block is sound, so the pilot valve alone: in stock at Hydra Parts, two days.", again.Context);
+    AnswerRequest(again, RequestAnswer.Approve());
+  }
+  LetItGoOn(repair);
+  runas (Mona) {
+    // ⭐ Ordered once, on HER say — and the plan came back typed.
+    Assert.Equal("pilot valve", Press().PartOnOrder);
+    Assert.Equal(1, Press().PartsOrdered);
+    var proposals = AgentProposal.OrderBy(p => p.At).ToList();
+    Assert.Equal([ProposalStatus.Rejected, ProposalStatus.Done], proposals.Select(p => p.Status).ToList());
+    Assert.Equal(Mona.Id, proposals[1].DecidedBy!.Id);
+    var r = TheRepair(repair);
+    Assert.Equal(RepairStage.CostApproval, r.Stage);
+    Assert.Equal(520m, r.Cost);
+    Assert.Equal(CriterionState.Met, CriterionOf(r.Job, "cause").State);
+  }
+
+  // ── Tue 11 Mar. The customer approves this quote, as it stands. ──
+  TestClock.Advance(TimeSpan.FromDays(1));
+  runas (Carl) {
+    var cost = Mine("Approve the cost");
+    Assert.Equal(RequestKind.Approval, cost.Asks);
+    Assert.Equal("r1", cost.SubjectVersion);
+    AnswerRequest(cost, RequestAnswer.Approve());
+  }
+  LetItGoOn(repair);
+
+  // ── Thu 13 Mar. Ines, who inspected, fits the valve. Her test run is evidence, and closes nothing. ──
+  TestClock.Advance(TimeSpan.FromDays(2));
+  runas (Ines) { AnswerRequest(Mine("Fit the pilot valve"), RequestAnswer.Of(new FittingReport { Done = "Pilot valve changed, seals renewed.", RanCleanOnTest = true })); }
+  LetItGoOn(repair);
+  runas (Mona) {
+    var r = TheRepair(repair);
+    Assert.Equal(RepairStage.Verifying, r.Stage);
+    Assert.Equal(AssignmentState.Open, r.Job.State);
+    Assert.Equal(2, r.Job.Criteria.Count(c => c.State == CriterionState.Met));
+    Assert.Equal("Pilot valve changed, seals renewed. Ran clean on the test run.", CurrentOf(ItemOf(r.Job, "fitting-1")!).Content);
+    // What done means is not met by the workshop's own word: the job cannot be closed yet, and says on whom it waits.
+    Assert.Throws<CriteriaUnmet>(() => CompleteAssignment(r.Job, "Fitted and tested."));
+    Assert.Equal(["Carl Lind"], ConditionsOf(r.Job).NextStepWith);
+  }
+
+  // ── Mon 17 Mar. It did not hold. The SAME job looks again; the coordinator cannot be reached. ──
+  TestClock.Advance(TimeSpan.FromDays(4));
+  TheAgentsAnswer(coordinatorDown: true);
+  runas (Carl) { AnswerRequest(Mine("Did press P-200 run a shift clean?"), RequestAnswer.Of(new ShiftReport { RanClean = false, Faults = 3, Notes = "The same E41, about an hour into the shift." })); }
+  LetItGoOn(repair);
+  runas (Mona) {
+    var r = TheRepair(repair);
+    Assert.Equal(2, r.Round);
+    Assert.Equal(AssignmentState.Open, r.Job.State);
+    Assert.Equal(1, Assignment.Count());                                              // the same job, not a second one
+    Assert.Equal(3, r.Job.Criteria.Count(c => c.State == CriterionState.Unmet));      // nothing it had settled is taken as settled
+    Assert.Equal("Faulted 3 times in the shift. The same E41, about an hour into the shift.", CurrentOf(ItemOf(r.Job, "shift-1")!).Content);
+    var trail = ActivityOf(r.Job, 200).Select(l => l.Said).ToList();
+    Assert.True(trail.Any(l => l.Contains("The press faulted 3 times in the first shift after the pilot valve was fitted.")));
+    // Everything it learnt the first time is still there: the report, the readings, the inspection, the supplier's
+    // answer, the fitting, the shift.
+    foreach (var key in ["report", "readings-1", "inspection-1", "supplier-1", "fitting-1", "shift-1"]) { Assert.NotNull(ItemOf(r.Job, key)); }
+    // The coordinator was tried twice, as its skill says, and gave up; the process handed the finding to a person.
+    Assert.Equal(RepairStage.ByHand, r.Stage);
+    Assert.Equal(["Failed", "Failed"], AgentTask.Where(t => t.RunItem == repair && t.RunState == "Investigating" && t.Parent == null && t.StartedAt >= new DateTime(2031, 3, 17, 0, 0, 0, DateTimeKind.Utc)).ToList().Select(t => t.Status.Name).ToList());
+  }
+
+  // ── Tue 18 Mar. The manager finds it by hand, from what the job holds. ──
+  TestClock.Advance(TimeSpan.FromDays(1));
+  runas (Mona) {
+    var r = TheRepair(repair);
+    Assert.Contains("Guard on the valve side refitted", string.Join(" ", ServiceHistory(r.Machine)));
+    FindByHand(r, "The pilot pressure sensor's cable chafes on the guard that was refitted in 2030, and shorts when the press is warm. The valve was worn, and was not the cause.", "sensor cable");
+  }
+  TheAgentsAnswer();
+  LetItGoOn(repair);
+  runas (Mona) {
+    // The coordinator is back. It read what the job holds before it proposed anything.
+    var planning = CoordinatorsWork(repair, "Planning");
+    Assert.Equal(["ListItems"], Trajectory.Of(planning.Id));
+    Assert.Equal("The manager found the sensor's cable chafing on the guard. A cable cures that; the valve is new.", Mine("Service coordinator proposes").Context);
+    AnswerRequest(Mine("Service coordinator proposes"), RequestAnswer.Approve());
+  }
+  LetItGoOn(repair);
+
+  // ── Wed 19 Mar. A second quote is a second approval: the first covered the first. ──
+  TestClock.Advance(TimeSpan.FromDays(1));
+  runas (Carl) {
+    var cost = Mine("Approve the cost");
+    Assert.Equal("r2", cost.SubjectVersion);
+    Assert.Contains("230.00 EUR", cost.FactsJson);
+    AnswerRequest(cost, RequestAnswer.Approve());
+  }
+  LetItGoOn(repair);
+
+  // ── Fri 21 Mar. The cable is in. Mon 24 Mar. A whole shift clean. ──
+  TestClock.Advance(TimeSpan.FromDays(2));
+  runas (Ines) { AnswerRequest(Mine("Fit the sensor cable"), RequestAnswer.Of(new FittingReport { Done = "New sensor cable, routed clear of the guard.", RanCleanOnTest = true })); }
+  LetItGoOn(repair);
+  TestClock.Advance(TimeSpan.FromDays(3));
+  runas (Carl) { AnswerRequest(Mine("Did press P-200 run a shift clean?"), RequestAnswer.Of(new ShiftReport { RanClean = true, Faults = 0 })); }
+  LetItGoOn(repair);
+
+  runas (Mona) {
+    var r = TheRepair(repair);
+    Assert.Equal(RepairStage.Fixed, r.Stage);
+    Assert.Equal(AssignmentState.Completed, r.Job.State);
+    Assert.Equal("A sensor cable was fitted and the press ran a full shift clean.", r.Job.Outcome);
+    Assert.Equal(3, r.Job.Criteria.Count(c => c.State == CriterionState.Met));
+    // The last criterion is met by the customer's own report, which is an item of the job.
+    Assert.Equal(ItemOf(r.Job, "shift-2")!.Id, CriterionOf(r.Job, "clean").Evidence);
+    Assert.Equal("sensor cable", Press().PartOnOrder);
+    Assert.Equal(2, Press().PartsOrdered);
+    Assert.Equal(0, Requests.WaitedOnBy("Assignment", r.Job.Id).Count(q => q.Status == RequestStatus.Open));
+  }
+}
+
+// ── read back ───────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Floor)]
+void the_run_of_a_repair_tells_each_state_it_was_in_and_what_happened_there() {
+  var repair = TheFirstRepair();
+  TheSecondRepair(repair);
+  runas (Mona) {
+    var view = ProcessRunOf(ProcessRunAbout("RepairFlow", repair)!.Id)!;
+    Assert.Equal("Press P-200 at Carl Lind", view.Card.Title);
+    Assert.Equal("Machine repair", view.Card.Process);
+    Assert.Equal(ProcessStatus.Finished, view.Card.Status);
+    Assert.Equal("21 days", view.Card.Age);
+    Assert.Equal([
+      "Finding the cause", "Waiting for readings", "Inspecting on site", "Asking for the part", "Planning the repair",
+      "Waiting for the customer's yes", "Repairing", "Proving it holds",
+      "Finding the cause", "Found by hand", "Planning the repair", "Waiting for the customer's yes", "Repairing", "Proving it holds",
+      "Runs clean",
+    ], view.Stays.Select(s => s.Label).ToList());
+    // How long it stood where: two days for the readings, three for the supplier, four for the shift that failed.
+    Assert.Equal("2 days", view.Stays[1].Lasted);
+    Assert.Equal("2 days", view.Stays[2].Lasted);
+    Assert.Equal("3 days", view.Stays[3].Lasted);
+    Assert.Equal("4 days", view.Stays[7].Lasted);
+    Assert.Equal("1 day", view.Stays[9].Lasted);
+    // Whom each waiting state asked and who answered is told by Osysharp.HumanRequests.Processes, which this app
+    // keeps out (`without`, app.osy) — its own tests show those lines; here the run tells only the agents' work.
+    // What the coordinator proposed is told by its own work — the request it waits on is not said twice.
+    Assert.Equal([
+      "Service coordinator was given work: plan the repair.",
+      "Service coordinator's work waits for a person.",
+      "Service coordinator's work waits for a person.",
+      "Service coordinator finished: plan the repair.",
+    ], view.Stays[4].Moments.Select(m => m.Said).ToList());
+    // The second look: the coordinator was tried twice and gave up, and the process said what it did about it.
+    Assert.Equal([
+      "Service coordinator was given work: investigate fault.",
+      "Service coordinator's work failed.",
+      "Service coordinator was given work: investigate fault, attempt 2.",
+      "Service coordinator's work failed.",
+      "Service coordinator gave up after 2 attempts.",
+      "The coordinator could not finish, so the workshop manager finds the cause by hand.",
+    ], view.Stays[8].Moments.Select(m => m.Said).ToList());
+    Assert.Equal(["Waiting for the workshop manager's own finding.", "Mona Berg answered the found step."], view.Stays[9].Moments.Select(m => m.Said).ToList());
+    // What it cost: every model call of every piece of the agents' work in the run — hers to read.
+    Assert.True(view.Cost.Known);
+    Assert.True(view.Cost.Spent > 0);
+    var work = AgentWorkInRun(view.Card.Id);
+    Assert.Equal(["Service coordinator", "Service coordinator", "Service coordinator", "Service coordinator", "Service coordinator"], work.Steps.Select(s => s.Name).ToList());
+    Assert.Equal(3, work.Steps[0].HandedOn);
+  }
+}
+
+[Test(Floor)]
+void each_reader_of_a_repair_sees_what_is_theirs() {
+  var repair = TheFirstRepair();
+  TheSecondRepair(repair);
+  Guid job = Guid.Empty;
+  Guid run = Guid.Empty;
+  Guid first = Guid.Empty;
+  var kept = 0;
+  // The manager: the job with everything it holds, the run with what it cost, and each piece of the agents' work
+  // with what it was given and what it answered.
+  runas (Mona) {
+    var r = TheRepair(repair);
+    job = r.Job.Id;
+    run = ProcessRunAbout("RepairFlow", repair)!.Id;
+    first = AgentTask.Where(t => t.RunItem == repair && t.RunState == "Investigating" && t.Parent == null).OrderBy(t => t.StartedAt).First().Id;
+    // What the job holds, by what kind of thing each is: what people sent in and saw, what was said to and by the
+    // supplier, and what was concluded — by the coordinator, by the manager, and each piece of the agents' work as
+    // it handed its result back.
+    Assert.Equal(["The customer's report"], ItemsOf(r.Job, ItemKind.Input).Select(i => i.Title).ToList());
+    Assert.Equal([
+      "Pressure readings, look 1", "Inspection on site, look 1", "The pilot valve is fitted", "The customer's shift, look 1",
+      "The sensor cable is fitted", "The customer's shift, look 2",
+    ], ItemsOf(r.Job, ItemKind.Evidence).Select(i => i.Title).ToList());
+    Assert.Equal(["Hydra Parts on the pilot valve"], ItemsOf(r.Job, ItemKind.Correspondence).Select(i => i.Title).ToList());
+    var findings = ItemsOf(r.Job, ItemKind.Finding).Select(i => i.Title).ToList();
+    Assert.Contains("E41 points at the pilot circuit", findings);
+    Assert.Contains("Found by hand, look 2", findings);
+    Assert.Equal(2, findings.Count(f => f == "The repair of press P-200 — result"));
+    kept = ItemsOf(r.Job).Count;
+    var inspection = InspectAgentWork(first)!;
+    Assert.Equal("Why press P-200 faults", inspection.About);
+    Assert.Contains("look 1", inspection.Brief);
+    Assert.True(VerifyTrace(AgentTask.Single(t => t.Id == first)).Intact);
+    Assert.True(ProcessRunOf(run)!.Cost.Known);
+  }
+  // The technician who was on the job: the job and what it holds — and not what the models cost.
+  runas (Ines) {
+    Assert.Equal(1, Assignment.Count());
+    Assert.Equal(kept, ItemsOf(JobBy(job)).Count);
+    var view = ProcessRunOf(run)!;
+    Assert.Equal("Press P-200 at Carl Lind", view.Card.Title);
+    Assert.False(view.Cost.Known);
+    Assert.Equal("", view.Card.Cost);
+  }
+  // The customer: his own repair's standing, and what was asked of him. Not the job, not what it holds, not the
+  // run, not a line of the agents' work.
+  runas (Carl) {
+    Assert.Equal(RepairStage.Fixed, Repair.Single().Stage);
+    Assert.Equal(0, Assignment.Count());
+    Assert.Equal(0, RepositoryItem.Count());
+    Assert.Equal(0, AgentTask.Count());
+    Assert.Equal(0, AgentProposal.Count());
+    Assert.Throws<NotAuthorized>(() => ProcessRunOf(run));
+    Assert.Throws<NotAuthorized>(() => ProcessRunsNow(new ProcessFilter()));
+    Assert.Equal(0, Requests.Mine().Count);
+    Assert.Equal(5, HumanRequest.Count());              // the readings, two quotes, two shifts
+  }
+  // The supplier's link: used, it opens its one request with what was answered — and still nothing else.
+  var link = "";
+  runas (Mona) { link = Heard.Single(h => h.What == "mailed").About; }
+  Assert.Equal("Do you have a pilot valve for a P-series press?", ViewByLink(AnswerLink.From(link)).Title);
+  Assert.Equal(0, HumanRequest.Count());
+  Assert.Equal(0, Repair.Count());
+}

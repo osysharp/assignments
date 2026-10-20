@@ -1,0 +1,35 @@
+// Osysharp.Assignments.WorkQueues — what an assignment asks of people, in their inboxes and on the assignment.
+//
+// An assignment is owned until it is done; a request is an item in a person's work queue until it is answered. With
+// both in an app, a request put for an assignment is a piece of the assignment's work — who the next step is with,
+// since when, when it is wanted by — and an item in that person's inbox, whether or not they are on the assignment:
+//
+//     var request = AssignmentRequests.Ask(job, new NewRequest {
+//       Kind = RequestKind.Approval, To = customer, Title = "Approve the cost of the repair?",
+//       About = Subject.Of("RepairQuote", quote.Id, "Quote 114", version: "r" + quote.Revision),
+//     });
+//
+// ⚑ WHAT AN AGENT ASKS WHILE IT WORKS FOR AN ASSIGNMENT IS ATTACHED BY ITSELF. A proposal it puts to a person, a
+//   question it asks — each is a request that waits on a piece of the assignment's agent work, and so becomes a piece
+//   of the assignment's work too. Nothing to wire.
+//
+// ⚑ AN ANSWER CLOSES THE WORK AND COMPLETES NOTHING. The assignment is done when its criteria are met; a request that
+//   ran out of time, or was called off, closes its piece of work as failed or cancelled and waives nothing.
+package Osysharp.Assignments.WorkQueues {
+  version     "1.1.0";
+  minPlatform "0.14.0";
+  summary     "what an assignment asks of people: a request put for an assignment is a piece of its work and an item in the inbox of whoever it waits on; what an agent proposes or asks while working for the assignment is attached by itself; the answer closes the work, a reminder and a missed date are on the assignment's trail; the assignment's page lists who it is waiting on, and the inbox item says which assignment it is part of.";
+  completes   Osysharp.Assignments@1, Osysharp.HumanRequests@1;
+
+  model "model/**/*.osy";
+  tests "tests";
+  use Osysharp.Assignments@1;
+  use Osysharp.HumanRequests@1;
+  use Osysharp.WorkQueues@1;
+  use Osysharp.Llm@2;
+  use Osysharp.Identity@0;
+  use Osysharp.Workflow;
+  use Osysharp.ServiceHours;
+  use Osysharp.Observability;
+  use Osysharp.Ui;
+}

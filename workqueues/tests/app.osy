@@ -1,0 +1,39 @@
+// The producer's test project for Osysharp.Assignments.WorkQueues — a workshop that services other people's machines.
+// A press faults; the workshop owns that until it runs clean. On the way the customer is asked to approve the cost,
+// the technician is asked when he can visit, and an agent that reads the fault log proposes to order a part — each a
+// request in somebody's inbox, and each a piece of the job's work. And one repair walked from end to end as a process
+// (`model/repair.osy`, `repair.test.osy`): three specialists read the log, the history and the manual; readings on a
+// form; an inspection that goes on to a stand-in; a parts supplier asked through a link; an order the manager refuses
+// and then approves; the customer's yes to the cost; a repair that does not hold, and the same job opened again.
+// No model is ever called: its one model is scripted.
+app Pressworks {
+  model "model/**/*.osy";
+  tests "**/*.test.osy";
+  use Osysharp.Assignments@1;
+  use Osysharp.Assignments.WorkQueues@1;
+  use Osysharp.Assignments.Agents@1;
+  use Osysharp.Agents@1;
+  use Osysharp.Agents.Testing@1;
+  use Osysharp.Agents.HumanRequests@1;
+  use Osysharp.Agents.Inspector@1;
+  use Osysharp.Agents.Processes@1;
+  use Osysharp.Processes@1;
+  use Osysharp.WorkRepositories@1;
+  use Osysharp.WorkRepositories.Agents@1;
+  use Osysharp.HumanRequests@1;
+  use Osysharp.WorkQueues@1;
+  use Osysharp.Llm@2;
+  use Osysharp.Identity@0;
+  use Osysharp.Organizations@0;
+  use Osysharp.Organizations.ServicePlans@0;
+  use Osysharp.Presence@0;
+  use Osysharp.Observability;
+  use Osysharp.Workflow;
+  use Osysharp.ServiceHours;
+  use Osysharp.Storage;
+  use Osysharp.Diagrams@0;
+  use Osysharp.Ui;
+  // Kept out, though this app uses both kits it completes: that bridge's own tests use this kit, so a test app here
+  // that took it in too would need each released before the other (scripts/release/release-kits.py orders by it).
+  without Osysharp.HumanRequests.Processes;
+}

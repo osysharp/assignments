@@ -1,0 +1,598 @@
+// ⭐ ONE REPAIR, FROM THE CUSTOMER'S REPORT TO A PRESS THAT RUNS CLEAN — as a process the workshop follows.
+//
+// A customer reports a press that faults now and then. A coordinating agent has three specialists read the fault
+// log, the service history and the manual; asks the customer's operator for pressure readings on a form; has a
+// technician inspect on site; asks a parts supplier — who has no account — whether the part is in stock; plans the
+// repair and proposes the order, which the workshop manager decides; the customer approves the cost; the technician
+// fits the part; and the customer is asked to show that the press runs a shift clean. When it does not, the same job
+// is opened again, with everything it had learnt.
+namespace Pressworks;
+
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Assignments;
+using Osysharp.Assignments.WorkQueues;
+using Osysharp.Assignments.Agents;
+using Osysharp.WorkRepositories;
+using Osysharp.WorkRepositories.Agents;
+using Osysharp.Agents;
+using Osysharp.Agents.HumanRequests;
+using Osysharp.Llm;
+using Osysharp.Workflow;
+using Osysharp.Processes;
+
+policy IsCoordination => RoleGrant.Any(g => g.Member == user && g.Role == ShopRole.Coordination);
+policy IsReading      => RoleGrant.Any(g => g.Member == user && g.Role == ShopRole.Reading);
+policy IsAnAgent      => IsDiagnostics || IsCoordination || IsReading;
+
+// The workshop follows its repairs; the manager looks after what a job keeps.
+policy FollowsProcesses        => IsStaff;
+policy ManagesWorkRepositories => IsManager;
+
+/// One visit the workshop has made to a machine.
+entity ServiceVisit {
+  [Required] Machine Machine;
+  DateTime On;
+  [MaxLength(300)] string What = "";
+  security { allow read when IsStaff || IsAnAgent; allow create when IsStaff; }
+}
+
+/// What the maker's manual says of a fault code.
+entity ManualEntry {
+  [Required, Unique, MaxLength(20)] string Code;
+  [MaxLength(600)] string Says = "";
+  security { allow read when IsStaff || IsAnAgent; allow create when IsManager; }
+}
+
+public enum RepairStage {
+  [Label("Finding the cause")] Investigating,
+  [Label("Found by hand")] ByHand,
+  [Label("Waiting for readings")] Measuring,
+  [Label("Inspecting on site")] Inspecting,
+  [Label("Asking for the part")] Sourcing,
+  [Label("Planning the repair")] Planning,
+  [Label("Waiting for the customer's yes")] CostApproval,
+  Repairing,
+  [Label("Proving it holds")] Verifying,
+  [Label("Runs clean")] Fixed,
+  [Label("Not approved")] Declined,
+  [Label("Called off")] CalledOff,
+}
+
+/// ⭐ A REPAIR — the workshop's own record of one fault on one machine. Behind it is the job: an assignment that is
+/// owned until the press runs clean.
+entity Repair {
+  [Required] Machine Machine;
+  [Required] Person Customer;
+  [Required] Assignment Job;
+  /// The technician who goes out, and who stands in when he cannot.
+  [Required] Person Technician;
+  Person? StandIn;
+  /// Whoever inspected on site: the part is theirs to fit.
+  Person? OnSite;
+  RepairStage Stage = RepairStage.Investigating;
+  /// Which look at the fault this is: 1, and 2 when the first repair did not hold.
+  int Round = 1;
+  [MaxLength(400)] string Reported = "";
+  [MaxLength(400)] string Cause = "";
+  [MaxLength(80)] string Part = "";
+  decimal Cost = 0;
+  int QuoteRevision = 0;
+  [MaxLength(400)] string Note = "";
+  security {
+    allow read, create, update when IsStaff || IsAnAgent;
+    allow read when IsCustomer where Customer == user;
+  }
+}
+
+// ── what people are asked for ───────────────────────────────────────────────────────────────────────────────────────
+
+/// What the customer's operator reads off the gauges.
+public class PressureReadings {
+  /// Pilot pressure at the valve block, in bar.
+  public decimal PilotBar;
+  /// Main line pressure, in bar.
+  public decimal MainBar;
+  /// When it faults: on start, under load, when warm.
+  [MaxLength(120)] public string WhenItFaults = "";
+}
+
+/// What the technician found on site.
+public class InspectionReport {
+  /// What you saw, in a sentence or two.
+  [MaxLength(400)] public string Found = "";
+  /// A part has to be changed.
+  public bool PartNeeded;
+}
+
+/// What the parts supplier answers.
+public class PartAvailability {
+  /// You have it on the shelf.
+  public bool InStock;
+  /// Working days until it is at the workshop.
+  public int DeliveryDays;
+  /// Your price for one, in euros.
+  public decimal Price;
+}
+
+/// What the technician says when the part is in.
+public class FittingReport {
+  /// What was done.
+  [MaxLength(400)] public string Done = "";
+  /// It ran clean on the test run afterwards.
+  public bool RanCleanOnTest;
+}
+
+/// What the customer says after a shift.
+public class ShiftReport {
+  /// The press ran the whole shift without faulting.
+  public bool RanClean;
+  /// How many times it faulted.
+  public int Faults;
+  /// Anything the workshop should know.
+  [MaxLength(400)] public string? Notes;
+}
+
+// ── what the agents can do ──────────────────────────────────────────────────────────────────────────────────────────
+
+/// Every visit the workshop has made to the machine, oldest first.
+[Action("Read the service history", Query)]
+public List<string> ServiceHistory(Machine machine) {
+  return ServiceVisit.Where(v => v.Machine == machine).OrderBy(v => v.On).ToList().Select(v => $"{v.On:d MMM yyyy}: {v.What}").ToList();
+}
+
+/// What the maker's manual says of a fault code.
+[Action("Look a fault code up in the manual", Query)]
+public string ManualOn(string code) {
+  var entry = ManualEntry.FirstOrDefault(m => m.Code == code);
+  return entry == null ? "The manual has nothing on " + code + "." : entry!.Says;
+}
+
+/// The machine a skill is handed, by its id.
+public Machine MachineHanded(string inputJson) {
+  var id = HandOn.IdIn(inputJson);
+  return Machine.Single(m => m.Id == id);
+}
+
+string MachineNamed(string value) {
+  var m = Machine.FirstOrDefault(x => x.Id == Guid.Parse(value));
+  return m == null ? value : "Press " + m!.Serial;
+}
+
+public class LogFinding { public string Code = ""; public string Says = ""; }
+public class HistoryFinding { public string Says = ""; }
+public class ManualFinding { public string Says = ""; }
+
+/// Reads what the controller logged.
+public class ReadTheLog : Skill<Machine, LogFinding> {
+  public override string Description => "Read the machine's fault log and say which fault it shows, and how often.";
+  public override List<ActionInfo> Tools => [Actions.Of(ReadFaultLog)];
+  public override string Brief(Machine m) => $"Press {m.Serial}. Its id is {m.Id}.";
+  public override string Names(string action, string argument, string value) => argument == "machine" ? MachineNamed(value) : value;
+  public override string HandedSchema() => HandOn.ById("The machine whose log to read.");
+  public override Machine Handed(string inputJson) => MachineHanded(inputJson);
+}
+
+/// Reads what the workshop has done to the machine before.
+public class ReadTheHistory : Skill<Machine, HistoryFinding> {
+  public override string Description => "Read the machine's service history and say what bears on the fault.";
+  public override List<ActionInfo> Tools => [Actions.Of(ServiceHistory)];
+  public override string Brief(Machine m) => $"Press {m.Serial}. Its id is {m.Id}.";
+  public override string Names(string action, string argument, string value) => argument == "machine" ? MachineNamed(value) : value;
+  public override string HandedSchema() => HandOn.ById("The machine whose history to read.");
+  public override Machine Handed(string inputJson) => MachineHanded(inputJson);
+}
+
+/// Reads the maker's manual. A long read, on a small allowance.
+public class ReadTheManual : Skill<Machine, ManualFinding> {
+  public override string Description => "Look the machine's fault code up in the maker's manual.";
+  public override List<ActionInfo> Tools => [Actions.Of(ReadFaultLog), Actions.Of(ManualOn)];
+  public override string Brief(Machine m) => $"Press {m.Serial}. Its id is {m.Id}.";
+  public override string Names(string action, string argument, string value) => argument == "machine" ? MachineNamed(value) : value;
+  public override string HandedSchema() => HandOn.ById("The machine whose manual to read.");
+  public override Machine Handed(string inputJson) => MachineHanded(inputJson);
+}
+
+/// Reads service histories. It only reads.
+[Actor(Roles = [ShopRole.Reading])]
+public class HistoryReader : Agent {
+  public static Person Principal => new Person { Email = "history-reader@pressworks.example", DisplayName = "History reader" };
+  public override string Purpose => "You read what a workshop has done to a machine before.";
+  public override List<SkillBase> Skills => [new ReadTheHistory()];
+}
+
+/// Reads makers' manuals. It only reads.
+[Actor(Roles = [ShopRole.Reading])]
+public class ManualReader : Agent {
+  public static Person Principal => new Person { Email = "manual-reader@pressworks.example", DisplayName = "Manual reader" };
+  public override string Purpose => "You read machine makers' manuals.";
+  public override List<SkillBase> Skills => [new ReadTheManual()];
+}
+
+/// What the coordinator hands back when it has looked into a fault.
+public class FaultFinding {
+  /// What is most likely wrong, in a sentence.
+  public string Cause = "";
+  /// The part it points at, when it points at one.
+  public string Part = "";
+  /// Readings from the customer's operator would settle it.
+  public bool NeedsReadings;
+}
+
+/// What the coordinator hands back when the repair is planned.
+public class RepairPlan {
+  public string Part = "";
+  /// Hours on site.
+  public int Hours;
+  /// What the customer is asked to approve, in euros.
+  public decimal Cost;
+}
+
+/// Looks into a fault: has the log, the history and the manual read, and writes down what they show.
+public class InvestigateFault : Skill<Repair, FaultFinding> {
+  public override string Description => "Find out why the press faults: have its log, its service history and the maker's manual read, and write down what they show.";
+  public override string Instructions => "Read what the job already holds before anything else. Record what you conclude as a finding on the job.";
+  public override List<ActionInfo> Tools => [Actions.Of(ListItems), Actions.Of(ReadItem), Actions.Of(RecordFinding)];
+  public override string Brief(Repair r) => $"Press {r.Machine.Serial} (machine id {r.Machine.Id}), look {r.Round}. The customer says: {r.Reported} The job's id is {r.Job.Id}.";
+  // A model that cannot be reached is tried once more before the work gives up.
+  public override RetryRule Retry => new RetryRule { Attempts = 2 };
+}
+
+/// Plans the repair and orders the part.
+public class PlanTheRepair : Skill<Repair, RepairPlan> {
+  public override string Description => "Plan the repair: order the part it needs, and say what the customer is asked to approve.";
+  public override string Instructions => "Order the smallest part that cures the cause. An hour on site is 95 euros.";
+  public override List<ActionInfo> Tools => [Actions.Of(ListItems), Actions.Of(ReadItem), Actions.Of(OrderPart)];
+  public override string Brief(Repair r) => $"Press {r.Machine.Serial} (machine id {r.Machine.Id}), look {r.Round}. The cause: {r.Cause} The job's id is {r.Job.Id}.";
+  public override string Names(string action, string argument, string value) => argument == "machine" ? MachineNamed(value) : value;
+}
+
+/// ⭐ IN CHARGE OF A REPAIR. It reads and writes the job's repository by itself; an order is proposed to a person,
+/// every time. The three readings are handed on — the manual's on a small allowance of its own.
+[Actor(Roles = [ShopRole.Coordination])]
+public class ServiceCoordinator : Agent {
+  public static Person Principal => new Person { Email = "coordinator@pressworks.example", DisplayName = "Service coordinator" };
+  public override string Purpose => "You coordinate the repair of a customer's machine for a workshop.";
+  public override List<SkillBase> Skills => [new InvestigateFault(), new PlanTheRepair()];
+  public override Permits May => new Permits { Alone = [Actions.Of(RecordFinding)], ProposeEveryTime = [Actions.Of(OrderPart)] };
+  public override Delegation Delegates => new Delegation {
+    To = [
+      Specialist.Of<Diagnoser>(new ReadTheLog()),
+      Specialist.Of<HistoryReader>(new ReadTheHistory()),
+      Specialist.Of<ManualReader>(new ReadTheManual(), budget: 0.006m),
+    ],
+    MaxDepth = 1,
+  };
+}
+
+// ── the process ─────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// ⭐ THE REPAIR OF ONE MACHINE. Two steps are the coordinator's work, six wait on a person — the customer, a
+/// technician, a parts supplier, the manager — and one is taken by the manager when the coordinator cannot.
+workflow RepairFlow {
+  Tracks = Repair.Stage; Autostart = false; Initial = Investigating;
+  /// The manager's own finding, when the coordinator could not finish.
+  event Found(string cause, string part);
+  /// The customer no longer wants the repair.
+  event CallOff();
+
+  state Investigating {
+    enter {
+      var found = await AssignedWork.Do(this.Item.Job, Agents.Of<ServiceCoordinator>(), new InvestigateFault(), this.Item,
+                                        key: "investigate-" + this.Item.Round.ToString(), about: "Why press " + this.Item.Machine.Serial + " faults");
+      if (!found.Done) {
+        Processes.Problem("The coordinator could not finish, so the workshop manager finds the cause by hand.");
+        goto ByHand;
+      }
+      this.Item.Cause = found.Result.Cause;
+      this.Item.Part = found.Result.Part;
+      if (found.Result.NeedsReadings) { goto Measuring; }
+      goto Planning;
+    }
+  }
+  state ByHand {
+    subscribe Found(string cause, string part);
+    enter { Processes.Waiting("Waiting for the workshop manager's own finding."); }
+    on Found(string cause, string part) {
+      default {
+        this.Item.Cause = cause;
+        this.Item.Part = part;
+        goto Planning;
+      }
+    }
+  }
+  state Measuring {
+    enter {
+      var ask = Workflow.Once("ask-readings", () => AskForReadings(this.Item));
+      var answer = await Requests.Answer(ask);
+      if (answer.Answered) { KeepReadings(this.Item, answer.As<PressureReadings>()); }
+      else { Processes.Problem("No readings came from the customer: " + answer.ClosedWhy); }
+      goto Inspecting;
+    }
+  }
+  state Inspecting {
+    enter {
+      var ask = Workflow.Once("ask-inspection", () => AskForAnInspection(this.Item));
+      var answer = await Requests.Answer(ask);
+      if (!answer.Answered) {
+        this.Item.Note = "Nobody inspected the press: " + answer.ClosedWhy;
+        goto CalledOff;
+      }
+      KeepInspection(this.Item, answer.As<InspectionReport>(), answer.ByName);
+      this.Item.OnSite = answer.By == null ? null : Person.FirstOrDefault(p => p.Id == answer.By);
+      goto Sourcing;
+    }
+  }
+  state Sourcing {
+    enter {
+      var ask = Workflow.Once("ask-supplier", () => AskTheSupplier(this.Item));
+      var answer = await Requests.Answer(ask);
+      if (answer.Answered) { KeepAvailability(this.Item, answer.As<PartAvailability>(), answer.ByName); }
+      else { Processes.Problem("The parts supplier did not answer: " + answer.ClosedWhy); }
+      goto Planning;
+    }
+  }
+  state Planning {
+    enter {
+      // Nobody is named: what the coordinator proposes goes to whoever answers for it — the workshop manager.
+      var plan = await AssignedWork.Do(this.Item.Job, Agents.Of<ServiceCoordinator>(), new PlanTheRepair(), this.Item,
+                                       key: "plan-" + this.Item.Round.ToString(), about: "The repair of press " + this.Item.Machine.Serial);
+      if (!plan.Done || !PartOrderedNow(this.Item.Machine.Id, plan.Result.Part)) {
+        this.Item.Note = plan.Done ? "No part was ordered." : "No repair was planned: " + plan.Problem;
+        goto CalledOff;
+      }
+      this.Item.Part = plan.Result.Part;
+      this.Item.Cost = plan.Result.Cost;
+      this.Item.QuoteRevision = this.Item.QuoteRevision + 1;
+      MeetCause(this.Item);
+      goto CostApproval;
+    }
+  }
+  state CostApproval {
+    enter {
+      var ask = Workflow.Once("ask-cost", () => AskTheCustomerForTheCost(this.Item));
+      var answer = await Requests.Answer(ask);
+      if (!answer.Approved) {
+        this.Item.Note = answer.Rejected ? "The customer did not approve the cost: " + answer.Comment : "The customer never answered: " + answer.ClosedWhy;
+        goto Declined;
+      }
+      MeetCost(this.Item, ask);
+      goto Repairing;
+    }
+  }
+  state Repairing {
+    enter {
+      var ask = Workflow.Once("ask-fitting", () => AskForTheFitting(this.Item));
+      var answer = await Requests.Answer(ask);
+      if (!answer.Answered) {
+        this.Item.Note = "The part was never fitted: " + answer.ClosedWhy;
+        goto CalledOff;
+      }
+      // The technician's own test run is evidence, and closes nothing: whether the press runs a shift clean is the
+      // customer's to show.
+      KeepFitting(this.Item, answer.As<FittingReport>(), answer.ByName);
+      goto Verifying;
+    }
+  }
+  state Verifying {
+    enter {
+      var ask = Workflow.Once("ask-shift", () => AskForAShiftReport(this.Item));
+      var answer = await Requests.Answer(ask);
+      if (!answer.Answered) {
+        this.Item.Note = "The customer never said how the shift went: " + answer.ClosedWhy;
+        goto CalledOff;
+      }
+      var shift = answer.As<ShiftReport>();
+      if (shift.RanClean) {
+        CloseOnACleanShift(this.Item, shift);
+        goto Fixed;
+      }
+      // ⭐ The repair did not hold. The SAME job looks into it again, with everything it has learnt: what it had
+      // settled — the cause, the cost — is back in question, and nothing it holds is thrown away.
+      BackInQuestion(this.Item, shift);
+      this.Item.Round = this.Item.Round + 1;
+      goto Investigating;
+    }
+  }
+  on CallOff { goto CalledOff; }
+
+  terminal success Fixed     { }
+  terminal cancel  Declined  { Message = "the customer did not approve the cost"; }
+  terminal cancel  CalledOff { Message = "the repair was called off"; }
+}
+
+/// The repair of a machine, for the people who follow it.
+public class MachineRepair : Process<Repair> {
+  public override string Name => "Machine repair";
+  public override string Workflow => "RepairFlow";
+  public override string Purpose => "From a customer's report to a machine that runs a shift clean.";
+  public override WorkflowGraph Graph => RepairFlow.Graph;
+  public override TimeSpan? StuckAfter => TimeSpan.FromDays(4);
+  public override string TitleOf(Repair r) => "Press " + r.Machine.Serial + " at " + r.Customer.DisplayName;
+  public override List<WorkflowAuditEntry> HistoryOf(Repair r) => RepairFlow.For(r).Audit;
+}
+
+// ── what the process asks, and keeps ────────────────────────────────────────────────────────────────────────────────
+
+/// Whether the part is on order for the machine, as it is stored now — after whatever a person decided meanwhile.
+[Server, Authorize(IsAuthenticated), OwnUnitOfWork]
+internal bool PartOrderedNow(Guid machine, string part) { return Machine.Single(m => m.Id == machine).PartOnOrder == part; }
+
+/// Ask the customer's operator for readings: a form made from `PressureReadings`.
+public HumanRequest AskForReadings(Repair r) {
+  var ask = NewRequest.For<PressureReadings>();
+  ask.To = r.Customer;
+  ask.Title = "Three readings from press " + r.Machine.Serial;
+  ask.Context = "The log points at the pilot circuit. The readings tell us whether the pressure really drops.";
+  ask.Within = TimeSpan.FromDays(3);
+  ask.AskedByName = "Machine repair";
+  return AssignmentRequests.Ask(r.Job, ask, key: "readings-" + r.Round.ToString());
+}
+
+/// Ask the technician to inspect on site. When he has not answered in a day it goes on to whoever stands in.
+public HumanRequest AskForAnInspection(Repair r) {
+  var ask = NewRequest.For<InspectionReport>();
+  ask.To = r.Technician;
+  ask.EscalateTo = r.StandIn;
+  ask.Title = "Inspect the valve block of press " + r.Machine.Serial;
+  ask.Context = "Suspected: " + r.Cause;
+  ask.Within = TimeSpan.FromDays(1);
+  ask.ExpireAfter = TimeSpan.FromDays(6);
+  ask.AskedByName = "Machine repair";
+  return AssignmentRequests.Ask(r.Job, ask, key: "inspection-" + r.Round.ToString());
+}
+
+/// Ask the parts supplier — who has no account — whether the part is in stock. It answers through a link.
+public HumanRequest AskTheSupplier(Repair r) {
+  var ask = NewRequest.For<PartAvailability>();
+  ask.OutsideName = "Hydra Parts";
+  ask.OutsideEmail = "orders@hydraparts.example";
+  ask.Title = "Do you have a " + r.Part + " for a P-series press?";
+  ask.Context = "Pressworks needs one for a customer's press " + r.Machine.Serial + ".";
+  ask.Within = TimeSpan.FromDays(2);
+  ask.ExpireAfter = TimeSpan.FromDays(5);
+  ask.AskedByName = "Machine repair";
+  return AssignmentRequests.Ask(r.Job, ask, key: "supplier-" + r.Round.ToString());
+}
+
+/// Put the cost to the customer: an approval of this quote, as it stands.
+public HumanRequest AskTheCustomerForTheCost(Repair r) {
+  var quote = new RepairQuote { Job = r.Job, Amount = r.Cost, Revision = r.QuoteRevision };
+  return AssignmentRequests.Ask(r.Job, new NewRequest {
+    Kind = RequestKind.Approval, To = r.Customer, Title = "Approve the cost of the repair?",
+    Context = "A " + r.Part + ", fitted on site. " + r.Cause,
+    Facts = [new RequestFact("Cost", r.Cost.ToString("0.00") + " EUR"), new RequestFact("Part", r.Part)],
+    About = Subject.Of("RepairQuote", quote.Id, "The quote for press " + r.Machine.Serial, version: "r" + r.QuoteRevision.ToString()),
+    Within = TimeSpan.FromDays(3), AskedByName = "Machine repair",
+  }, key: "quote-" + r.QuoteRevision.ToString());
+}
+
+/// Ask the technician to fit the part, and to say how the test run went.
+public HumanRequest AskForTheFitting(Repair r) {
+  var ask = NewRequest.For<FittingReport>();
+  ask.To = r.OnSite ?? r.Technician;
+  ask.Title = "Fit the " + r.Part + " to press " + r.Machine.Serial;
+  ask.Context = "The customer has approved the cost. Run the press for two hours afterwards.";
+  ask.Within = TimeSpan.FromDays(5);
+  ask.AskedByName = "Machine repair";
+  return AssignmentRequests.Ask(r.Job, ask, key: "fitting-" + r.Round.ToString());
+}
+
+/// Ask the customer to show that the press works again: a shift, and what happened in it.
+public HumanRequest AskForAShiftReport(Repair r) {
+  var ask = NewRequest.For<ShiftReport>();
+  ask.To = r.Customer;
+  ask.Title = "Did press " + r.Machine.Serial + " run a shift clean?";
+  ask.Context = "We fitted a " + r.Part + ". Tell us how the first full shift went.";
+  ask.Within = TimeSpan.FromDays(3);
+  ask.ExpireAfter = TimeSpan.FromDays(10);
+  ask.AskedByName = "Machine repair";
+  return AssignmentRequests.Ask(r.Job, ask, key: "shift-" + r.Round.ToString());
+}
+
+/// The readings, kept as evidence on the job.
+public void KeepReadings(Repair r, PressureReadings readings) {
+  AddItem(r.Job, new NewItem {
+    Kind = ItemKind.Evidence, Key = "readings-" + r.Round.ToString(), Title = "Pressure readings, look " + r.Round.ToString(),
+    Content = $"Pilot {readings.PilotBar} bar, main {readings.MainBar} bar. Faults {readings.WhenItFaults}.",
+    Source = new ItemSource { From = r.Customer.DisplayName + ", on the form" } });
+}
+
+/// What the technician found, kept as evidence.
+public void KeepInspection(Repair r, InspectionReport report, string by) {
+  AddItem(r.Job, new NewItem {
+    Kind = ItemKind.Evidence, Key = "inspection-" + r.Round.ToString(), Title = "Inspection on site, look " + r.Round.ToString(),
+    Content = report.Found + (report.PartNeeded ? " A part has to be changed." : " No part has to be changed."),
+    Source = new ItemSource { From = by + ", on site" } });
+}
+
+/// What the supplier answered, kept as correspondence.
+public void KeepAvailability(Repair r, PartAvailability a, string by) {
+  AddItem(r.Job, new NewItem {
+    Kind = ItemKind.Correspondence, Key = "supplier-" + r.Round.ToString(), Title = "Hydra Parts on the " + r.Part,
+    Content = (a.InStock ? "In stock" : "Not in stock") + $", {a.DeliveryDays} working days, {a.Price:0.00} EUR.",
+    Source = new ItemSource { From = by + ", through the link they were sent" } });
+}
+
+/// The cause is found: the criterion is met by the finding the coordinator — or the manager — recorded.
+public void MeetCause(Repair r) {
+  var finding = ItemsOf(r.Job, ItemKind.Finding).LastOrDefault();
+  var criterion = CriterionOf(r.Job, "cause");
+  if (finding == null) { MeetCriterion(criterion, r.Cause); }
+  else { MeetWith(criterion, finding!, r.Cause); }
+}
+
+/// The customer's yes meets the cost.
+public void MeetCost(Repair r, HumanRequest approval) {
+  MeetCriterion(CriterionOf(r.Job, "cost"), $"{r.Cost:0.00} EUR approved by {r.Customer.DisplayName}, quote r{r.QuoteRevision}.", approval.Id, "HumanRequest");
+}
+
+/// What the technician did, and how the test run went, kept as evidence.
+public void KeepFitting(Repair r, FittingReport report, string by) {
+  AddItem(r.Job, new NewItem {
+    Kind = ItemKind.Evidence, Key = "fitting-" + r.Round.ToString(), Title = "The " + r.Part + " is fitted",
+    Content = report.Done + (report.RanCleanOnTest ? " Ran clean on the test run." : " Faulted on the test run."),
+    Source = new ItemSource { From = by + ", on site" } });
+}
+
+RepositoryItem KeepShift(Repair r, ShiftReport shift) {
+  return AddItem(r.Job, new NewItem {
+    Kind = ItemKind.Evidence, Key = "shift-" + r.Round.ToString(), Title = "The customer's shift, look " + r.Round.ToString(),
+    Content = (shift.RanClean ? "Ran the whole shift clean." : $"Faulted {shift.Faults} times in the shift.") + (shift.Notes == null ? "" : " " + shift.Notes!),
+    Source = new ItemSource { From = r.Customer.DisplayName + ", on the form" } });
+}
+
+/// ⭐ THE CUSTOMER SHOWED THAT IT HOLDS: the last criterion is met by their own report, and the job is done.
+public void CloseOnACleanShift(Repair r, ShiftReport shift) {
+  MeetWith(CriterionOf(r.Job, "clean"), KeepShift(r, shift), "A whole shift clean, as the customer reports");
+  CompleteAssignment(r.Job, $"A {r.Part} was fitted and the press ran a full shift clean.");
+}
+
+/// ⭐ THE REPAIR DID NOT HOLD. What the customer saw is kept, and what the job had settled is back in question: the
+/// cause it acted on was not the cause, and a second repair is a second cost.
+public void BackInQuestion(Repair r, ShiftReport shift) {
+  KeepShift(r, shift);
+  var why = $"The press faulted {shift.Faults} times in the first shift after the {r.Part} was fitted.";
+  ReopenCriterion(CriterionOf(r.Job, "cause"), why);
+  ReopenCriterion(CriterionOf(r.Job, "cost"), "A second repair is a second quote.");
+}
+
+// ── what the workshop does ──────────────────────────────────────────────────────────────────────────────────────────
+
+/// The desk takes a customer's report: the job is opened, the people and the agents are put on it, and the repair
+/// starts.
+public Repair ReportFault(Machine machine, Person customer, Person technician, Person? standIn, string reported) {
+  var job = OpenAssignment(new NewAssignment {
+    Title = "Press " + machine.Serial + " faults intermittently",
+    Goal = "The press runs a full shift without faulting.",
+    Scope = "This press. Parts and hours up to what the customer approves.",
+    Assignees = [technician, Agents.Of<ServiceCoordinator>().Actor, Agents.Of<Diagnoser>().Actor, Agents.Of<HistoryReader>().Actor, Agents.Of<ManualReader>().Actor],
+    Budget = 0.10m, Process = "machine-repair", ProcessVersion = "1",
+  });
+  AddCriterion(job, "The cause is found", key: "cause");
+  AddCriterion(job, "The customer approved the cost", key: "cost");
+  AddCriterion(job, "The press ran clean for a shift", key: "clean");
+  if (standIn != null) { AddParticipant(job, standIn!, ParticipantRole.Contributor); }
+  AddItem(job, new NewItem { Kind = ItemKind.Input, Key = "report", Title = "The customer's report", Content = reported,
+                             Source = new ItemSource { From = customer.DisplayName + ", by telephone" } });
+  var repair = new Repair { Machine = machine, Customer = customer, Technician = technician, StandIn = standIn, Job = job, Reported = reported };
+  UnitOfWork.Commit();
+  Workflow.Run(repair);
+  return repair;
+}
+
+/// The manager's own finding, when the coordinator could not finish: written on the job, and the repair goes on.
+public void FindByHand(Repair r, string cause, string part) {
+  AddItem(r.Job, new NewItem { Kind = ItemKind.Finding, Key = "by-hand-" + r.Round.ToString(), Title = "Found by hand, look " + r.Round.ToString(), Content = cause,
+                               Source = new ItemSource { From = "The workshop manager, from what the job holds" } });
+  RepairFlow.RaiseFound(r, cause, part);
+}
+
+/// The customer no longer wants it.
+public void CallRepairOff(Repair r) { RepairFlow.RaiseCallOff(r); }
+
+/// The mail the workshop "sends": the link for somebody with no account.
+[On] void MailTheLink(HumanRequestPut e) {
+  if (e.Request.OutsideEmail != "") { new Heard { What = "mailed", About = AnswerLinkFor(e.Request) }; }
+}

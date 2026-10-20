@@ -1,0 +1,61 @@
+// The workshop the tests run in: the desk, two technicians, the manager — who answers for the agents — a customer,
+// one queue, and a press with a fault log, a service history and a page of its maker's manual.
+using Osysharp.Identity;
+using Osysharp.Organizations;
+using Osysharp.Organizations.ServicePlans;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Assignments;
+using Osysharp.Assignments.WorkQueues;
+using Osysharp.Agents;
+using Osysharp.Workflow;
+using Pressworks;
+
+[TestFixture]
+void Floor() {
+  var dana  = new Person { Email = "dana@pressworks.example",  DisplayName = "Dana Holm",  CodeHash = Security.HashPassword("1111") };
+  var tariq = new Person { Email = "tariq@pressworks.example", DisplayName = "Tariq Aziz", CodeHash = Security.HashPassword("2222") };
+  var mona  = new Person { Email = "mona@pressworks.example",  DisplayName = "Mona Berg",  CodeHash = Security.HashPassword("3333") };
+  var carl  = new Person { Email = "carl@foundry.example",     DisplayName = "Carl Lind",  CodeHash = Security.HashPassword("4444") };
+  new RoleGrant { Member = dana,  Role = ShopRole.Desk };
+  new RoleGrant { Member = tariq, Role = ShopRole.Technician };
+  new RoleGrant { Member = mona,  Role = ShopRole.Manager };
+  new RoleGrant { Member = carl,  Role = ShopRole.Customer };
+  var ines  = new Person { Email = "ines@pressworks.example",  DisplayName = "Ines Falk",  CodeHash = Security.HashPassword("5555") };
+  new RoleGrant { Member = ines,  Role = ShopRole.Technician };
+
+  new OrganizationTier { Name = "Standard", Rank = 1, IsDefault = true };
+  var queue = new Queue { Name = "Workshop", Position = 1 };
+  foreach (var p in new List<Person> { dana, tariq, mona, carl, ines }) { new QueueMember { Queue = queue, Member = p }; }
+
+  var press = new Machine { Serial = "P-200", FaultLog = "E41 pilot pressure low, 14 times since March. Clears on restart." };
+  new ServiceVisit { Machine = press, On = new DateTime(2029, 11, 12), What = "Yearly service. Hydraulic oil and filters changed." };
+  new ServiceVisit { Machine = press, On = new DateTime(2030, 9, 3), What = "Guard on the valve side refitted after a collision with a pallet truck." };
+  new ManualEntry { Code = "E41", Says = "E41: pilot pressure below 45 bar for more than 2 s. Check the pilot valve seat, then the pilot pressure sensor and its cable." };
+  new AgentSeat { Agent = "Pressworks.Diagnoser", Sponsor = mona };
+  new AgentSeat { Agent = "Pressworks.ServiceCoordinator", Sponsor = mona };
+  new AgentSeat { Agent = "Pressworks.HistoryReader", Sponsor = mona };
+  new AgentSeat { Agent = "Pressworks.ManualReader", Sponsor = mona };
+}
+
+principal Dana  => Person.Single(p => p.Email == "dana@pressworks.example");
+principal Tariq => Person.Single(p => p.Email == "tariq@pressworks.example");
+principal Mona  => Person.Single(p => p.Email == "mona@pressworks.example");
+principal Carl  => Person.Single(p => p.Email == "carl@foundry.example");
+principal Ines  => Person.Single(p => p.Email == "ines@pressworks.example");
+
+Machine Press() { return Machine.Single(m => m.Serial == "P-200"); }
+Assignment JobBy(Guid id) { return Assignment.Single(a => a.Id == id); }
+string MachineArg(Machine m) { return "{\"machine\":\"" + m.Id.ToString() + "\"}"; }
+string PartArgs(Machine m, string part) { return "{\"machine\":\"" + m.Id.ToString() + "\",\"part\":\"" + part + "\"}"; }
+
+/// The press's job, opened by the desk with Tariq and the diagnoser on it.
+Guid OpenPressJob() {
+  Guid id = Guid.Empty;
+  runas (Dana) {
+    var job = OpenRepair(Press(), Tariq);
+    UnitOfWork.Commit();
+    id = job.Id;
+  }
+  return id;
+}

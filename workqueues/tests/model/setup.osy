@@ -1,0 +1,32 @@
+// The workshop's agent and its model. In a file of its own with no `namespace`, because an `app.X = …` statement's
+// value is resolved outside the file's namespace.
+using Osysharp.Agents;
+using Osysharp.Agents.HumanRequests;
+using Osysharp.Agents.Inspector;
+using Osysharp.Processes;
+using Osysharp.WorkRepositories;
+using Osysharp.Llm;
+using Osysharp.WorkQueues;
+using Pressworks;
+
+app.Llm = new LlmSetup {
+  Models = [
+    new LlmModel { Name = "Small", Client = new ScriptedModel { Name = "Small" }, Model = "scripted-small",
+                   Price = new LlmPrice { Input = 1, Output = 5 }, MaxOutputTokens = 1000 },
+  ],
+  Default = "Small",
+};
+
+app.Agents = new AgentsSetup {
+  Agents = [new Diagnoser(), new ServiceCoordinator(), new HistoryReader(), new ManualReader()],
+  TaskBudget = 0.05m,
+};
+app.Processes = new ProcessesSetup { Processes = [new MachineRepair()], RunPage = "/repairs/{run}" };
+app.AgentInspector = new AgentInspectorSetup { WorkPage = "/work/{task}/{step}" };
+// What was said to and by a supplier is kept for a year after the job closes.
+app.WorkRepositories = new WorkRepositoriesSetup {
+  Kinds = [ new KindRule { Kind = ItemKind.Correspondence, RetainFor = TimeSpan.FromDays(365) } ],
+  ItemPath = "/items/",
+};
+app.AgentRequests = new AgentRequestsSetup { Queue = "Workshop" };
+app.Inbox = new InboxSetup { DefaultQueue = "Workshop" };

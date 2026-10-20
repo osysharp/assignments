@@ -1,0 +1,138 @@
+// A request put for an assignment is a piece of the assignment's work, and stays in step with it.
+namespace Osysharp.Assignments.WorkQueues;
+
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Assignments;
+
+/// What a piece of attached work that IS a request says its subject is.
+public const string RequestWork = "HumanRequest";
+/// What a request put for an assignment says is waiting for it.
+public const string AssignmentWaits = "Assignment";
+/// What a request an agent put says is waiting for it: the agent's piece of work, by its receipt.
+const string AgentWorkWaits = "AgentTask";
+
+/// ⭐ WHAT AN ASSIGNMENT ASKS OF PEOPLE.
+public class AssignmentRequests {
+  /// ⭐ PUT A REQUEST FOR AN ASSIGNMENT. The same call as `PutRequest(ask)`, with the request attached to the
+  /// assignment as a piece of its work: who the next step is with, when it is wanted by, and — when it is answered,
+  /// runs out of time or is called off — how it ended. Asked again under the same `key` (a process step that is run
+  /// again), the request already put is answered.
+  ///
+  /// The person asked need not be on the assignment: the request is in their inbox either way.
+  public static HumanRequest Ask(Assignment a, NewRequest ask, string key = "", string branch = "") {
+    if (key != "") {
+      var there = WorkOf(a, key);
+      if (there != null && there!.Subject != null && there!.SubjectType == RequestWork) {
+        var put = HumanRequest.FirstOrDefault(r => r.Id == there!.Subject);
+        if (put != null) { return put!; }
+      }
+    }
+    if (ask.WaitingWork == null) { ask.WaitingWork = Subject.Of(AssignmentWaits, a.Id, a.Title); }
+    var request = PutRequest(ask);
+    AttachRequest(a, request, key, branch);
+    return request;
+  }
+
+  /// The requests of an assignment that are still open, the oldest first — as whoever is looking may read them.
+  public static List<HumanRequest> Open(Assignment a) {
+    var ids = OpenRequestIds(a);
+    if (ids.Count == 0) { return []; }
+    return HumanRequest.Where(r => r.Status == RequestStatus.Open && ids.Contains(r.Id)).OrderBy(r => r.ArrivedAt).ToList();
+  }
+
+  /// The assignment a request is part of. Null: none — or it is not the reader's to read.
+  public static Assignment? Of(HumanRequest request) {
+    var work = AssignmentWork.FirstOrDefault(w => w.SubjectType == RequestWork && w.Subject == request.Id);
+    return work == null ? null : work!.Assignment;
+  }
+}
+
+/// The ids of the requests attached to an assignment whose work is still open.
+List<Guid> OpenRequestIds(Assignment a) {
+  List<Guid> ids = [];
+  foreach (var w in AssignmentWork.Where(x => x.Assignment == a && x.SubjectType == RequestWork && x.State == WorkState.Open).ToList()) {
+    if (w.Subject != null) { ids.Add(w.Subject!.Value); }
+  }
+  return ids;
+}
+
+/// Attach a request to an assignment as a piece of its work.
+AssignmentWork AttachRequest(Assignment a, HumanRequest r, string key, string branch) {
+  var waitingFor = r.Asks == RequestKind.Approval ? "their approval" : r.Asks == RequestKind.Information ? "the details asked for" : "their answer";
+  if (r.To == null && r.OutsideName != "") { waitingFor = waitingFor.Replace("their", r.OutsideName + "'s"); }
+  return AttachWork(a, new WorkAttachment {
+    Kind = WorkKind.Request, Key = key != "" ? key : "request:" + r.Id.ToString(), Title = r.Title, Subject = r.Id, SubjectType = RequestWork,
+    Branch = branch, WaitingOn = r.To, WaitingFor = waitingFor, DueAt = r.DueAt,
+  });
+}
+
+/// The piece of work a request is, while it is open. Null: it is not part of an assignment.
+AssignmentWork? OpenWorkOf(HumanRequest r) {
+  return AssignmentWork.FirstOrDefault(w => w.SubjectType == RequestWork && w.Subject == r.Id && w.State == WorkState.Open);
+}
+
+// ── what an agent asks while it works for an assignment ─────────────────────────────────────────────────────────────
+
+[On]
+void AttachWhatAnAgentAsks(HumanRequestPut e) {
+  var r = e.Request;
+  if (r.WaitingType != AgentWorkWaits || r.WaitingId == null) { return; }
+  // The agent's piece of work is attached to an assignment: the request it waits on is that assignment's too.
+  var agentWork = AssignmentWork.FirstOrDefault(w => w.Kind == WorkKind.AgentTask && w.Subject == r.WaitingId && w.State == WorkState.Open);
+  if (agentWork == null) { return; }
+  AttachRequest(agentWork!.Assignment, r, "", agentWork!.Branch);
+}
+
+// ── kept in step ────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[On]
+void ClosedWhenAnswered(HumanRequestAnswered e) {
+  var work = OpenWorkOf(e.Request);
+  if (work == null) { return; }
+  var outcome = OutcomeOf(e.Request);
+  var who = outcome.ByName == "" ? "Somebody" : outcome.ByName;
+  var said = outcome.Approved ? $"Approved by {who}."
+           : outcome.Rejected ? $"Not approved by {who}: {outcome.Comment}"
+           : $"Answered by {who}.";
+  CloseWork(work!, WorkState.Done, said);
+}
+
+[On]
+void ClosedWhenItRanOut(HumanRequestExpired e) {
+  var work = OpenWorkOf(e.Request);
+  if (work != null) { CloseWork(work!, WorkState.Failed, "Nobody answered in the time it could wait."); }
+}
+
+[On]
+void ClosedWhenCalledOff(HumanRequestCancelled e) {
+  var work = OpenWorkOf(e.Request);
+  if (work != null) { CloseWork(work!, WorkState.Cancelled, e.Why == "" ? "The request was called off." : "The request was called off: " + e.Why); }
+}
+
+[On]
+void RemindersAreOnTheTrail(HumanRequestReminded e) {
+  var work = OpenWorkOf(e.Request);
+  if (work != null) { NoteWorkActivity(work!, ActivityKind.Reminder, $"reminder {e.Number} sent."); }
+}
+
+[On]
+void AMissedDateIsOnTheTrail(HumanRequestOverdue e) {
+  var work = OpenWorkOf(e.Request);
+  if (work == null) { return; }
+  // Late is not closed: the work stays open, and the next step moves with the request when it goes on to somebody.
+  if (e.EscalatedTo != null) {
+    UpdateWork(work!, new WorkUpdate { WaitingOn = e.EscalatedTo });
+    NoteWorkActivity(work!, ActivityKind.Note, $"its date passed with no answer; it went on to {NameOf(e.EscalatedTo)}.");
+  } else {
+    NoteWorkActivity(work!, ActivityKind.Note, "its date passed with no answer. It still waits.");
+  }
+}
+
+[On]
+void ANewDateMovesWithIt(HumanRequestRetimed e) {
+  var work = OpenWorkOf(e.Request);
+  if (work == null || e.Request.DueAt == null) { return; }
+  UpdateWork(work!, new WorkUpdate { DueAt = e.Request.DueAt, Why = e.Why == "" ? "The request was given a new date." : e.Why });
+}

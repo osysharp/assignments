@@ -1,0 +1,165 @@
+// The repair of press P-200, on screen — driven as the people of the workshop, at three moments of it: the manager's
+// inbox on the Monday the coordinator proposes an order; the repair's run page once it is over; and the page of the
+// coordinator's first piece of work, with the three readings it handed on. `osy test --pixels` photographs each —
+// wide and on a phone, light and dark (`Ui.Shot`).
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Assignments;
+using Osysharp.Assignments.WorkQueues;
+using Osysharp.WorkRepositories;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Agents.HumanRequests;
+using Osysharp.Agents.Inspector;
+using Osysharp.Processes;
+using Osysharp.Workflow;
+using Pressworks;
+
+/// The first week of the repair, to the Monday the supplier has answered and the coordinator proposes its order.
+/// Answers the repair's id.
+Guid TheRepairToTheProposal() {
+  TestClock.Set(new DateTime(2031, 3, 3, 8, 0, 0, DateTimeKind.Utc));
+  Guid repair = Guid.Empty;
+  TheAgentsAnswer();
+  runas (Dana) {
+    var r = ReportFault(Press(), Carl, Tariq, Ines, "It stops with E41 two or three times a week, always after it has run a while.");
+    Workflow.Settle(r);
+    repair = r.Id;
+  }
+  LetItGoOn(repair);
+  TestClock.Advance(TimeSpan.FromDays(2));
+  runas (Carl) { AnswerRequest(Mine("Three readings"), RequestAnswer.Of(new PressureReadings { PilotBar = 38, MainBar = 210, WhenItFaults = "when it is warm, an hour or so in" })); }
+  LetItGoOn(repair);
+  TestClock.Advance(TimeSpan.FromDays(1));
+  LetItGoOn(repair);
+  TestClock.Advance(TimeSpan.FromDays(1));
+  runas (Ines) { AnswerRequest(Mine("Inspect the valve block"), RequestAnswer.Of(new InspectionReport { Found = "The pilot valve's seat is scored. The block itself is sound.", PartNeeded = true })); }
+  LetItGoOn(repair);
+  TestClock.Advance(TimeSpan.FromDays(3));
+  var link = "";
+  runas (Mona) { link = Heard.Single(h => h.What == "mailed").About; }
+  AnswerByLink(AnswerLink.From(link), new RequestAnswer { Values = new Dictionary<string, string> { ["InStock"] = "true", ["DeliveryDays"] = "2", ["Price"] = "140" } }, "Bo Ek");
+  LetItGoOn(repair);
+  return repair;
+}
+
+/// ⭐ THE INBOX MOMENT: what the coordinator proposes is a request in the manager's inbox, with what it would do,
+/// why, what it looked at first — and which job it is part of. She says no, with a reason, there.
+[Test(Floor)]
+void the_manager_reads_the_order_the_coordinator_proposes_and_says_no_in_her_inbox() {
+  var repair = TheRepairToTheProposal();
+  Guid item = Guid.Empty;
+  runas (Mona) { item = Mine("Service coordinator proposes").Id; }
+
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Mona);
+  Ui.Visit("/inbox/mine/i/" + item);
+  Assert.Visible("Service coordinator proposes: Order a part");
+  Assert.Visible("The pilot valve's seat is scored. A new valve block replaces the valve and its seals in one visit.");
+  Assert.Visible("valve block assembly");
+  Assert.Visible("Press P-200 faults intermittently", within: "Part of an assignment");
+  Assert.NoOverflow();
+  Ui.Shot("repair-inbox-proposal-wide-light");
+  Ui.Theme("dark");
+  Ui.Shot("repair-inbox-proposal-wide-dark");
+  Ui.Theme("light");
+
+  Ui.Viewport(390, 844);
+  Ui.Visit("/inbox/mine/i/" + item);
+  Assert.Visible("Service coordinator proposes: Order a part");
+  Assert.NoOverflow();
+  Ui.Shot("repair-inbox-proposal-phone-light");
+  Ui.Theme("dark");
+  Ui.Shot("repair-inbox-proposal-phone-dark");
+  Ui.Theme("light");
+
+  // The job's page, meanwhile, says on whom it waits.
+  Guid job = Guid.Empty;
+  runas (Mona) { job = TheRepair(repair).Job.Id; }
+  Ui.Viewport(1440, 900);
+  Ui.Visit("/jobs/" + job);
+  Assert.Visible("Press P-200 faults intermittently");
+  Assert.Visible("Service coordinator proposes: Order a part", within: "Waiting on people");
+  Assert.Visible("Hydra Parts on the pilot valve");
+  Assert.NoOverflow();
+  Ui.Shot("repair-job-waiting-wide-light");
+}
+
+/// ⭐ THE RUN PAGE, once the repair is over: the process drawn with the way it went — round the loop twice — each
+/// state it was in and for how long, and what happened there.
+[Test(Floor)]
+void the_run_page_of_a_repair_shows_the_way_it_went_twice_round() {
+  var repair = TheFirstRepair();
+  TheSecondRepair(repair);
+  Guid run = Guid.Empty;
+  runas (Mona) { run = ProcessRunAbout("RepairFlow", repair)!.Id; }
+
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Mona);
+  Ui.Visit("/repairs");
+  Assert.Visible("Press P-200 at Carl Lind", within: "Runs");
+  Assert.Visible("Runs clean", within: "Press P-200 at Carl Lind");
+  Ui.Click("Press P-200 at Carl Lind");
+
+  Assert.Visible("Press P-200 at Carl Lind", within: "Where it stands");
+  Assert.Visible("Finished", within: "Where it stands");
+  Assert.Visible("21 days", within: "In figures");
+  Assert.Probe("FlowCanvas", "nodes", 12);
+  Assert.Visible("Service coordinator finished: investigate fault.", within: "State 1, Finding the cause");
+  Assert.Visible("Service coordinator gave up after 2 attempts.", within: "State 9, Finding the cause");
+  Assert.Visible("The coordinator could not finish, so the workshop manager finds the cause by hand.", within: "State 9, Finding the cause");
+  Assert.Visible("Mona Berg answered the found step.", within: "State 10, Found by hand");
+  Assert.Visible("From any state: call off leads to Called off.");
+  Assert.NoOverflow();
+  Ui.Shot("repair-run-wide-light");
+  Ui.Theme("dark");
+  Ui.Shot("repair-run-wide-dark");
+  Ui.Theme("light");
+
+  Ui.Viewport(390, 844);
+  Ui.Visit("/repairs/" + run);
+  Assert.Visible("Press P-200 at Carl Lind", within: "Where it stands");
+  Assert.NoOverflow();
+  Ui.Shot("repair-run-phone-light");
+  Ui.Theme("dark");
+  Ui.Shot("repair-run-phone-dark");
+  Ui.Theme("light");
+
+  // A technician follows the repair too — and is not shown what the models cost.
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Ines);
+  Ui.Visit("/repairs/" + run);
+  Assert.Visible("Press P-200 at Carl Lind", within: "Where it stands");
+  Assert.Hidden("Spent on models");
+}
+
+/// ⭐ ONE PIECE OF THE AGENTS' WORK, opened: the coordinator's first look — what it was given, the three readings
+/// it handed on, the one that ran out of money, what it wrote down and what it handed back.
+[Test(Floor)]
+void the_coordinators_first_look_is_opened_with_the_readings_it_handed_on() {
+  var repair = TheRepairToTheProposal();
+  Guid work = Guid.Empty;
+  runas (Mona) { work = CoordinatorsWork(repair, "Investigating").Id; }
+
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Mona);
+  Ui.Visit("/work/" + work + "/0");
+  Assert.Visible("Why press P-200 faults");
+  Assert.Visible("Manual reader, read the manual", within: "Handed on");
+  Assert.Visible("Stopped", within: "Handed on");
+  Assert.NoOverflow();
+  Ui.Shot("repair-work-wide-light");
+  Ui.Theme("dark");
+  Ui.Shot("repair-work-wide-dark");
+  Ui.Theme("light");
+
+  Ui.Viewport(390, 844);
+  Ui.Visit("/work/" + work + "/0");
+  Assert.Visible("Why press P-200 faults");
+  Assert.NoOverflow();
+  Ui.Shot("repair-work-phone-light");
+  Ui.Theme("dark");
+  Ui.Shot("repair-work-phone-dark");
+}
