@@ -1,0 +1,316 @@
+// A small tea shop. A customer's parcel has not come; the shop owns that until the customer has the tea or their money
+// back.
+namespace Teashop;
+
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Assignments;
+using Osysharp.Assignments.Agents;
+using Osysharp.WorkRepositories;
+
+[Role] enum ShopRole { Authenticator, Customer, Support, Lead, Resolver }
+
+partial entity RoleGrant { security { allow read when IsAuthenticated; } }
+
+policy IsCustomer => RoleGrant.Any(g => g.Member == user && g.Role == ShopRole.Customer);
+policy IsSupport  => RoleGrant.Any(g => g.Member == user && g.Role == ShopRole.Support);
+policy IsLead     => RoleGrant.Any(g => g.Member == user && g.Role == ShopRole.Lead);
+policy IsResolver => RoleGrant.Any(g => g.Member == user && g.Role == ShopRole.Resolver);
+
+// Customers and support open a case; the lead oversees every case and may close one short of what done means.
+policy OpensAssignments            => IsCustomer || IsSupport || IsLead;
+policy OverseesAssignments         => IsLead;
+policy AcceptsAssignmentExceptions => IsLead;
+// Support gives the agent work; the lead is in charge of it and reads what it did and what it cost.
+policy UsesAgents        => IsSupport || IsLead;
+policy SupervisesAgents  => IsLead;
+policy AuditsAgents      => IsLead;
+policy ReadsModelUsage   => IsLead;
+policy ManagesModelSpend => IsLead;
+policy ManagesWorkRepositories => IsLead;
+
+/// A customer, somebody at the shop, or the agent's own account.
+entity Person : Principal {
+  security {
+    allow read when IsAuthenticated || IsAuthenticator;
+    allow create when IsAuthenticator;
+  }
+}
+
+public enum OrderStatus { Paid, Shipped, Delivered, Refunded }
+
+/// An order.
+entity ShopOrder {
+  [Required, Unique, MaxLength(20)] string Number;
+  [Required] Person Customer;
+  decimal Total;
+  OrderStatus Status = OrderStatus.Shipped;
+  [MaxLength(60)] string Carrier = "";
+  [MaxLength(60)] string TrackingCode = "";
+  /// How many times it was refunded. An order is refunded once.
+  int Refunds = 0;
+  security {
+    allow read when IsCustomer where Customer == user;
+    allow read, update when IsSupport || IsLead || IsResolver;
+  }
+}
+
+/// One scan of an order's parcel, as the carrier reports it.
+entity CarrierScan {
+  [Required] ShopOrder Order;
+  DateTime At;
+  [MaxLength(100)] string Place = "";
+  [MaxLength(200)] string What = "";
+  security { allow read when IsSupport || IsLead || IsResolver; }
+}
+
+/// ⭐ A DELIVERY CASE — the shop's own record. The customer sees "your delivery case"; behind it is an assignment.
+entity DeliveryCase {
+  [Required, Unique] ShopOrder Order;
+  [Required] Assignment Assignment;
+  security {
+    allow read when IsCustomer where Order.Customer == user;
+    allow read when IsSupport || IsLead || IsResolver;
+    allow create when IsCustomer || IsSupport;
+  }
+}
+
+// ── what the agent can do ───────────────────────────────────────────────────────────────────────────────────────────
+
+/// What an order says about itself.
+public class OrderFacts {
+  public string Number = "";
+  public string Status = "";
+  public decimal Total;
+  public string Carrier = "";
+  public string TrackingCode = "";
+}
+
+/// What the order says: its status, its total, who carries it.
+[Action("Look up the order", Query)]
+public OrderFacts CheckOrder(ShopOrder order) {
+  return new OrderFacts { Number = order.Number, Status = order.Status.Name, Total = order.Total, Carrier = order.Carrier, TrackingCode = order.TrackingCode };
+}
+
+/// Every scan of the order's parcel, oldest first.
+[Action("Track the parcel", Query)]
+public List<string> TrackParcel(ShopOrder order) {
+  return CarrierScan.Where(s => s.Order == order).OrderBy(s => s.At).ToList().Select(s => $"{s.At:d MMM HH:mm} {s.Place}: {s.What}").ToList();
+}
+
+/// Refund the order in full. An order is refunded ONCE for its case: asked again, it answers what was done the
+/// first time and refunds nothing.
+[Action("Refund the order")]
+public string RefundOrder(ShopOrder order, string reason) {
+  var theCase = DeliveryCase.Single(c => c.Order == order).Assignment;
+  var done = DoneFor(theCase, "refund:" + order.Number);
+  if (done != null) { return "Already refunded: " + done!.Result; }
+  order.Status = OrderStatus.Refunded;
+  order.Refunds = order.Refunds + 1;
+  RecordDone(theCase, "refund:" + order.Number, "Refund order " + order.Number, $"{order.Total} EUR refunded: {reason}", order.Id, "ShopOrder");
+  return $"Refunded {order.Total} EUR.";
+}
+
+/// Write down on the case what shows where a parcel is — the shop's own tool, so it is written as the agent, for
+/// whoever asked. (Osysharp.WorkRepositories.Agents has tools like it; this app keeps that bridge out — see app.osy.)
+[Action("Write down evidence on the case")]
+public string NoteEvidence(Assignment assignment, string title, string content, string source) {
+  var item = AddItem(assignment, new NewItem { Kind = ItemKind.Evidence, Title = title, Content = content, Source = new ItemSource { From = source } });
+  return $"Written down as item {item.Id}.";
+}
+
+/// Keep on the case what was written to the customer.
+[Action("Keep a letter to the customer on the case")]
+public string KeepLetter(Assignment assignment, string title, string content, string source) {
+  var item = AddItem(assignment, new NewItem { Kind = ItemKind.Correspondence, Title = title, Content = content, Source = new ItemSource { From = source } });
+  return $"Kept as item {item.Id}.";
+}
+
+/// What the agent hands back when it has found out where an order is.
+public class DeliveryFinding {
+  /// The parcel is lost: it will not arrive.
+  public bool Lost;
+  /// What happened, in a sentence.
+  public string What = "";
+  /// What it suggests: "refund", "replacement" or "wait".
+  public string Suggests = "";
+}
+
+/// Finds out where an order is, and writes down what shows it.
+public class InvestigateDelivery : Skill<ShopOrder, DeliveryFinding> {
+  public override string Description => "Find out where the order is.";
+  public override string Instructions => "Look up the order and track its parcel. Record what the carrier's scans show as evidence on the case before you conclude anything.";
+  public override List<ActionInfo> Tools => [Actions.Of(CheckOrder), Actions.Of(TrackParcel), Actions.Of(NoteEvidence)];
+  public override string Brief(ShopOrder o) => $"Order {o.Number} (id {o.Id}) has not arrived.";
+  public override string? Check(DeliveryFinding f) => f.Suggests != "refund" && f.Suggests != "replacement" && f.Suggests != "wait" ? "Suggest \"refund\", \"replacement\" or \"wait\"." : null;
+  public override string Version => "2";
+  // Handed on by another agent, the order is named by its id.
+  public override string HandedSchema() => HandOn.ById("The order to find.");
+  public override ShopOrder Handed(string inputJson) {
+    var id = HandOn.IdIn(inputJson);
+    return ShopOrder.Single(o => o.Id == id);
+  }
+}
+
+/// What the agent hands back when it has settled an order.
+public class Settlement {
+  public bool Refunded;
+  public string Said = "";
+}
+
+/// Settles a lost order: refunds it and writes to the customer.
+public class SettleDelivery : Skill<ShopOrder, Settlement> {
+  public override string Description => "Refund the order and tell the customer.";
+  public override List<ActionInfo> Tools => [Actions.Of(RefundOrder), Actions.Of(KeepLetter)];
+  public override string Brief(ShopOrder o) => $"Order {o.Number} (id {o.Id}) is lost. Refund it and write to the customer.";
+}
+
+/// A quick look, on a budget far under the shop's.
+public class GlanceAtDelivery : Skill<ShopOrder, DeliveryFinding> {
+  public override string Description => "Glance at where the order is.";
+  public override List<ActionInfo> Tools => [Actions.Of(TrackParcel), Actions.Of(NoteEvidence)];
+  public override decimal? Budget => 0.012m;
+}
+
+/// The shop's agent for delivery problems.
+[Actor(Roles = [ShopRole.Resolver])]
+public class Resolver : Agent {
+  public static Person Principal => new Person { Email = "resolver@teashop.example", DisplayName = "Resolver" };
+  public override string Purpose => "You resolve delivery problems for a small tea shop: find out what happened, write down what shows it, and settle it.";
+  public override List<SkillBase> Skills => [new InvestigateDelivery(), new SettleDelivery(), new GlanceAtDelivery()];
+  // What it does here it does by itself: this app's tests are not about what a person approves first.
+  public override Permits May => Permits.Everything();
+}
+
+// ── the case ────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Leads a case: has the order found by the resolver, and says what came of it.
+public class LeadTheCase : Skill<ShopOrder, DeliveryFinding> {
+  public override string Description => "Lead a delivery case: have the order found, and say what came of it.";
+  public override string Brief(ShopOrder o) => $"Order {o.Number} (id {o.Id}) has not arrived.";
+}
+
+/// In charge of a case. It hands the finding-out to the resolver.
+[Actor(Roles = [ShopRole.Resolver])]
+public class CaseLead : Agent {
+  public static Person Principal => new Person { Email = "case-lead@teashop.example", DisplayName = "Case lead" };
+  public override string Purpose => "You lead delivery cases for a small tea shop.";
+  public override List<SkillBase> Skills => [new LeadTheCase()];
+  public override Permits May => Permits.Everything();
+  public override Delegation Delegates => new Delegation { To = [Specialist.Of<Resolver>(new InvestigateDelivery())] };
+}
+
+/// Put the case lead on a case, and have it lead: its work — and the work it hands on — is the case's.
+public AgentOutcome<DeliveryFinding> Lead(DeliveryCase c, bool withTheResolver = true) {
+  AddParticipant(c.Assignment, Agents.Of<CaseLead>().Actor, ParticipantRole.Assignee);
+  if (!withTheResolver) { RemoveResolverFrom(c); }
+  UnitOfWork.Commit();
+  return await AssignedWork.Do(c.Assignment, Agents.Of<CaseLead>(), new LeadTheCase(), c.Order, key: "lead",
+                               about: "Lead the case of order " + c.Order.Number);
+}
+
+/// Take the resolver off a case: it is no longer one of those who act on it.
+public void RemoveResolverFrom(DeliveryCase c) {
+  var resolver = Agents.Of<Resolver>().Actor;
+  foreach (var p in AssignmentParticipant.Where(x => x.Assignment == c.Assignment && x.Person == resolver).ToList()) { RemoveParticipant(c.Assignment, p.Person); }
+}
+
+/// "My order has not arrived." The customer opens the case; support owns it; the agent is on it.
+public DeliveryCase ReportMissing(ShopOrder order, Person owner, string need, DateTime wantedBy) {
+  var a = OpenAssignment(new NewAssignment {
+    Title = "Order " + order.Number + " has not arrived",
+    Goal = "The customer has the order, or their money back. " + need,
+    Scope = "This order only. A replacement or a refund up to the order's total.",
+    Owner = owner, Assignees = [Agents.Of<Resolver>().Actor], DueAt = wantedBy, Budget = 0.05m,
+    Process = "delivery-resolution", ProcessVersion = "1",
+  });
+  AddCriterion(a, "The parcel is delivered or the order is refunded", key: "resolved");
+  AddCriterion(a, "The customer has been told the outcome", key: "told");
+  return new DeliveryCase { Order = order, Assignment = a };
+}
+
+/// Have the agent find out where the order is — for whoever asks, as a piece of work of the case.
+public AgentOutcome<DeliveryFinding> Investigate(DeliveryCase c) {
+  return await AssignedWork.Do(c.Assignment, Agents.Of<Resolver>(), new InvestigateDelivery(), c.Order, key: "investigate",
+                               about: "Find out where order " + c.Order.Number + " is");
+}
+
+/// Have the agent settle a lost order.
+public AgentOutcome<Settlement> Settle(DeliveryCase c) {
+  return await AssignedWork.Do(c.Assignment, Agents.Of<Resolver>(), new SettleDelivery(), c.Order, key: "settle",
+                               about: "Settle order " + c.Order.Number);
+}
+
+/// The same look at a glance, on a small budget.
+public AgentOutcome<DeliveryFinding> Glance(DeliveryCase c) {
+  return await AssignedWork.Do(c.Assignment, Agents.Of<Resolver>(), new GlanceAtDelivery(), c.Order, key: "glance");
+}
+
+/// Ask the customer something, and wait for the answer.
+public void AskCustomer(DeliveryCase c, string question, DateTime by) {
+  var a = c.Assignment;
+  AddItem(a, new NewItem { Kind = ItemKind.Correspondence, Title = "Asked the customer", Content = question, Source = new ItemSource { From = "Sent by mail" } });
+  AttachWork(a, new WorkAttachment {
+    Kind = WorkKind.Request, Key = "ask-customer", Title = "Ask the customer: " + question, WaitingOn = c.Order.Customer,
+    WaitingFor = "their answer", DueAt = by,
+  });
+}
+
+/// The customer's answer — theirs to give: it is their case.
+public void CustomerAnswers(DeliveryCase c, string answer) {
+  var a = c.Assignment;
+  var said = AddItem(a, new NewItem { Kind = ItemKind.Correspondence, Key = "customer-answer", Title = "The customer's answer", Content = answer, Source = new ItemSource { From = "The customer, through their case page" } });
+  var wait = WorkOf(a, "ask-customer");
+  if (wait != null) { CloseWork(wait!, WorkState.Done, "The customer answered."); }
+  NoteProgress(a, "The customer answered: " + answer, said.Id, "RepositoryItem");
+}
+
+/// Record the decision, and that the case is resolved by it.
+public void DecideRefund(DeliveryCase c, string why) {
+  var a = c.Assignment;
+  var decision = AddItem(a, new NewItem { Kind = ItemKind.Decision, Key = "decision", Title = "Refund in full", Content = why });
+  AcceptItem(decision, "Within what support may refund.");
+  MeetWith(CriterionOf(a, "resolved"), decision, "Refunded in full");
+}
+
+/// Tell the customer how it ended.
+public void TellCustomer(DeliveryCase c, string message) {
+  var a = c.Assignment;
+  var letter = AddItem(a, new NewItem { Kind = ItemKind.Correspondence, Title = "Told the customer", Content = message, Source = new ItemSource { From = "Sent by mail" } });
+  MeetWith(CriterionOf(a, "told"), letter, "Told by mail");
+}
+
+/// Close the case, with a summary a model wrote — charged to the case.
+public void CloseCase(DeliveryCase c) {
+  var a = c.Assignment;
+  var summary = await Assignments.Complete(a, "Summarise how this delivery case ended: " + a.Goal, "closing summary");
+  CompleteAssignment(a, summary, obligations: "Watch that the refund reaches the customer's bank.");
+}
+
+/// Call a case off — in a unit of work of its own, as somebody else's request would be.
+[Server, OwnUnitOfWork]
+public void CallCaseOff(Guid id, string why) {
+  CancelAssignment(DeliveryCase.Single(c => c.Id == id).Assignment, why);
+}
+
+/// What a case has been charged so far, in millionths of a dollar — read where it is stored.
+[Server, OwnUnitOfWork]
+public long CaseCost(Guid id) { return CostOf(DeliveryCase.Single(c => c.Id == id).Assignment).TotalMicros; }
+
+// ── what the shop hears ─────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Something a script noted, so a test can read what a model was shown.
+entity Heard {
+  [Required, MaxLength(40)] string What;
+  [MaxLength(4000)] string About = "";
+  security { allow read, create when IsAuthenticated || IsAnonymous; }
+}
+
+/// Note what the last message of a request tells the model its tools answered — what a script sees on its next turn.
+public void NoteToolResults(LlmRequest request) {
+  if (request.Messages.Count == 0) { return; }
+  foreach (var b in request.Messages[request.Messages.Count - 1].Content) {
+    if (b.Kind == LlmBlockKind.ToolResult) { new Heard { What = "told", About = b.ResultJson ?? "" }; }
+  }
+}

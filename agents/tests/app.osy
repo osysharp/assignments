@@ -1,0 +1,24 @@
+// The producer's test project for Osysharp.Assignments.Agents — a small tea shop whose customer says "my order has
+// not arrived, and I need it before Friday". The delivery case is an assignment: an agent finds out where the parcel
+// is, the evidence and the correspondence are kept as items, the customer is asked, a refund is made once, and the
+// case is closed when its criteria are met — and opened again when the refund does not arrive.
+// No model is ever called: its one model is scripted.
+app Teashop {
+  model "model/**/*.osy";
+  tests "**/*.test.osy";
+  use Osysharp.Assignments@1;
+  use Osysharp.Assignments.Agents@1;
+  use Osysharp.WorkRepositories@1;
+  use Osysharp.Agents@1;
+  use Osysharp.Agents.Testing@1;
+  use Osysharp.Llm@2;
+  use Osysharp.Identity@0;
+  use Osysharp.Observability;
+  use Osysharp.Workflow;
+  use Osysharp.Storage;
+  use Osysharp.Ui;
+  // Kept out, though this app uses both kits it completes: that bridge's own tests use this kit, so a test app here
+  // that took it in too would need each released before the other (scripts/release/release-kits.py orders by it).
+  // The agent's tools that write to the case are the shop's own (model/app.osy).
+  without Osysharp.WorkRepositories.Agents;
+}

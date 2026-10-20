@@ -1,0 +1,93 @@
+// Work an agent hands on while it works for an assignment is the assignment's too. The case lead is given the case
+// of a missing order; it hands the finding-out to the resolver. Both pieces are attached to the case — each saying
+// who is doing it and through whom it came; and the whole is counted on the case once.
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Assignments;
+using Osysharp.Assignments.Agents;
+using Osysharp.WorkRepositories;
+using Teashop;
+
+/// The lead hands the finding-out on, and reports what came back; the resolver looks, tracks, writes it down.
+AgentCast LeadingTheCase(DeliveryCase c) {
+  return AgentCast.Of()
+    .Plays<CaseLead>(AgentScript.Of(
+      Says.HandTo<Resolver>(new InvestigateDelivery(), Says.Row(c.Order.Id)),
+      Says.HandBack(new DeliveryFinding { Lost = true, What = "Held as damaged at the Malmö depot since 6 March.", Suggests = "refund" })))
+    .Plays<Resolver>(InvestigationScript(c));
+}
+
+[Test(Shop)]
+void work_an_agent_hands_on_is_attached_to_the_same_assignment_and_counted_once() {
+  TestClock.Set(Tuesday());
+  var id = NoraReports();
+  Guid leading = Guid.Empty;
+  runas (Sana) {
+    var cast = LeadingTheCase(Case(id));
+    ScriptedAnswer.Stub((model, request) => cast.Answer(model, request));
+    var outcome = Lead(Case(id));
+    Assert.Equal("", outcome.Problem);
+    Assert.True(outcome.Result.Lost);
+    leading = outcome.Task;
+    Assert.Equal(["CaseLead · Lead the case: Done", "  Resolver · Investigate delivery: Done"], Trajectory.Tree(leading));
+  }
+  Background.Settle();
+  runas (Sana) {
+    var a = Case(id).Assignment;
+    var handedOn = AgentTask.Single(t => t.Parent.Id == leading);
+    // Two pieces of agent work on the case: the lead's, and the piece it handed on — which says through whom it came.
+    var pieces = AssignedWork.Of(a);
+    Assert.Equal(["Lead the case of order T-1042", "Resolver: investigate delivery — handed on by Case lead"], pieces.Select(w => w.Title).ToList());
+    Assert.Equal([WorkState.Done, WorkState.Done], pieces.Select(w => w.State).ToList());
+    Assert.Equal(handedOn.Id, pieces[1].Subject);
+    Assert.Equal("agent-task:" + handedOn.Id.ToString(), pieces[1].Key);
+    Assert.Equal("Resolver finished it.", pieces[1].Result);
+    // Counted once: the lead's piece carries the whole tree — its own two answers and the resolver's four — and the
+    // piece that was handed on carries nothing itself. Its own figure is on its receipt.
+    Assert.Equal(1200, pieces[0].CostMicros);
+    Assert.Equal(0, pieces[1].CostMicros);
+    Assert.Equal(800, handedOn.SpentMicros);
+    Assert.Equal(1200, CostOf(a).TotalMicros);
+    // Every call of the tree was charged to the case as it was made, and held to what the case may spend.
+    Assert.Equal(handedOn.ChargedTo, AgentTask.Single(t => t.Id == leading).ChargedTo);
+    Assert.Contains("assignment:", handedOn.ChargedTo);
+    // The evidence the resolver wrote down is the resolver's — written as its account, for whoever asked. (Tracing it
+    // to the resolver's piece, and filing what each piece handed back, is Osysharp.WorkRepositories.Agents' — shown
+    // by that bridge's own tests.)
+    var evidence = ItemsOf(a, ItemKind.Evidence).Single();
+    Assert.Equal(Agents.Of<Resolver>().Actor.Id, evidence.AddedBy!.Id);
+  }
+}
+
+[Test(Shop)]
+void a_specialist_that_is_not_on_the_assignment_is_not_attached_and_the_case_says_so() {
+  TestClock.Set(Tuesday());
+  var id = NoraReports();
+  Guid leading = Guid.Empty;
+  runas (Sana) {
+    var c = Case(id);
+    // Only what the lead hands on, with nothing written to the case by the resolver: it is not on it.
+    var cast = AgentCast.Of()
+      .Plays<CaseLead>(AgentScript.Of(
+        Says.HandTo<Resolver>(new InvestigateDelivery(), Says.Row(c.Order.Id)),
+        Says.HandBack(new DeliveryFinding { Lost = true, What = "Held at the depot.", Suggests = "refund" })))
+      .Plays<Resolver>(AgentScript.Of(
+        Says.Tool(Actions.Of(TrackParcel), OrderArg(c)),
+        Says.HandBack(new DeliveryFinding { Lost = true, What = "Held at the depot.", Suggests = "refund" })));
+    ScriptedAnswer.Stub((model, request) => cast.Answer(model, request));
+    var outcome = Lead(c, withTheResolver: false);
+    Assert.Equal("", outcome.Problem);
+    leading = outcome.Task;
+  }
+  Background.Settle();
+  runas (Sana) {
+    var a = Case(id).Assignment;
+    // One piece on the case — the lead's — which still counts the whole tree, and a note of what was handed to whom.
+    Assert.Equal(["Lead the case of order T-1042"], AssignedWork.Of(a).Select(w => w.Title).ToList());
+    Assert.Equal(800, AssignedWork.Of(a)[0].CostMicros);
+    Assert.Equal(1, AssignmentActivity.Count(n => n.Assignment == a
+      && n.Said == "Lead the case of order T-1042: Case lead handed part of this to Resolver, which is not on the assignment."));
+  }
+}

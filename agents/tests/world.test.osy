@@ -1,0 +1,85 @@
+// The tea shop the tests run in: two customers, two people in support, the lead who is in charge of the agent, and
+// an order whose parcel has stopped moving.
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Assignments;
+using Osysharp.WorkRepositories;
+using Teashop;
+
+[TestFixture]
+void Shop() {
+  var nora = new Person { Email = "nora@example.com",    DisplayName = "Nora Lind" };
+  var omar = new Person { Email = "omar@example.com",    DisplayName = "Omar Haddad" };
+  var sana = new Person { Email = "sana@teashop.example", DisplayName = "Sana Iqbal" };
+  var tim  = new Person { Email = "tim@teashop.example",  DisplayName = "Tim Varga" };
+  var lars = new Person { Email = "lars@teashop.example", DisplayName = "Lars Wik" };
+  new RoleGrant { Member = nora, Role = ShopRole.Customer };
+  new RoleGrant { Member = omar, Role = ShopRole.Customer };
+  new RoleGrant { Member = sana, Role = ShopRole.Support };
+  new RoleGrant { Member = tim,  Role = ShopRole.Support };
+  new RoleGrant { Member = lars, Role = ShopRole.Lead };
+  var order = new ShopOrder { Number = "T-1042", Customer = nora, Total = 42.00m, Carrier = "Postline", TrackingCode = "PL7731" };
+  new CarrierScan { Order = order, At = new DateTime(2026, 3, 4, 16, 20, 0), Place = "Gothenburg hub", What = "Received" };
+  new CarrierScan { Order = order, At = new DateTime(2026, 3, 6, 6, 12, 0), Place = "Malmö depot", What = "Damaged, held" };
+  new ShopOrder { Number = "T-1050", Customer = omar, Total = 18.50m, Carrier = "Postline", TrackingCode = "PL7790" };
+  // The lead answers for the agent.
+  new AgentSeat { Agent = "Teashop.Resolver", Sponsor = lars };
+  new AgentSeat { Agent = "Teashop.CaseLead", Sponsor = lars };
+}
+
+principal Nora => Person.Single(p => p.Email == "nora@example.com");
+principal Omar => Person.Single(p => p.Email == "omar@example.com");
+principal Sana => Person.Single(p => p.Email == "sana@teashop.example");
+principal Tim  => Person.Single(p => p.Email == "tim@teashop.example");
+principal Lars => Person.Single(p => p.Email == "lars@teashop.example");
+
+DateTime Tuesday() { return new DateTime(2026, 3, 10, 9, 0, 0); }
+DateTime Friday()  { return new DateTime(2026, 3, 13, 17, 0, 0); }
+
+/// Nora reports that T-1042 has not come. Answers the case's id.
+Guid NoraReports() {
+  Guid id = Guid.Empty;
+  runas (Nora) {
+    id = ReportMissing(ShopOrder.Single(o => o.Number == "T-1042"), Sana, "I need it before Friday.", Friday()).Id;
+  }
+  return id;
+}
+
+DeliveryCase Case(Guid id) { return DeliveryCase.Single(c => c.Id == id); }
+
+string OrderArg(DeliveryCase c) { return "{\"order\":\"" + c.Order.Id.ToString() + "\"}"; }
+string RefundArgs(DeliveryCase c) { return "{\"order\":\"" + c.Order.Id.ToString() + "\",\"reason\":\"Lost in transit\"}"; }
+string EvidenceArgs(DeliveryCase c) {
+  return "{\"assignment\":\"" + c.Assignment.Id.ToString() + "\",\"title\":\"Carrier scans for PL7731\","
+       + "\"content\":\"Last scan 6 March, Malmö depot: damaged, held. Nothing since.\",\"source\":\"Postline tracking\"}";
+}
+string LetterArgs(DeliveryCase c) {
+  return "{\"assignment\":\"" + c.Assignment.Id.ToString() + "\",\"title\":\"Refund confirmation\","
+       + "\"content\":\"We have refunded 42.00 EUR for order T-1042.\",\"source\":\"Sent by mail\"}";
+}
+
+/// What the model says when it finds out where the order is: looks it up, tracks it, writes the evidence down, concludes.
+AgentScript InvestigationScript(DeliveryCase c) {
+  return AgentScript.Of(
+    Says.Tool(Actions.Of(CheckOrder), OrderArg(c)),
+    Says.Tool(Actions.Of(TrackParcel), OrderArg(c)),
+    Says.Tool(Actions.Of(NoteEvidence), EvidenceArgs(c)),
+    Says.HandBack(new DeliveryFinding { Lost = true, What = "Held as damaged at the Malmö depot since 6 March.", Suggests = "refund" }));
+}
+
+/// …and when it settles it: refunds, writes to the customer, reports.
+AgentScript SettlementScript(DeliveryCase c) {
+  return AgentScript.Of(
+    Says.Tool(Actions.Of(RefundOrder), RefundArgs(c)),
+    Says.Tool(Actions.Of(KeepLetter), LetterArgs(c)),
+    Says.HandBack(new Settlement { Refunded = true, Said = "Refunded 42.00 EUR and told the customer." }));
+}
+
+/// Which turn of a piece of work a request is: how many times the model has already answered.
+int TurnOf(LlmRequest request) {
+  var turn = 0;
+  foreach (var m in request.Messages) { if (m.Role == "assistant") { turn = turn + 1; } }
+  return turn;
+}

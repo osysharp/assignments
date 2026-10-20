@@ -1,0 +1,26 @@
+// The tea shop's model, its agent, and how it keeps a case's repository. In a file of its own with no `namespace`,
+// because an `app.X = …` statement's value is resolved outside the file's namespace.
+using Osysharp.Agents;
+using Osysharp.Assignments;
+using Osysharp.Llm;
+using Osysharp.WorkRepositories;
+using Teashop;
+
+app.Llm = new LlmSetup {
+  Models = [
+    // $1 a million tokens in and $5 out: a scripted answer of 100 in and 20 out costs 200 millionths of a dollar.
+    new LlmModel { Name = "Small", Client = new ScriptedModel { Name = "Small" }, Model = "scripted-small",
+                   Price = new LlmPrice { Input = 1, Output = 5 }, MaxOutputTokens = 1000 },
+  ],
+  Default = "Small",
+};
+
+app.Agents = new AgentsSetup { Agents = [new Resolver(), new CaseLead()], TaskBudget = 0.05m };
+
+// A case that establishes nothing for a day is stalled.
+app.Assignments = new AssignmentsSetup { StalledAfter = TimeSpan.FromDays(1) };
+
+// What was said to and by the customer is kept for a year after the case closes.
+app.WorkRepositories = new WorkRepositoriesSetup {
+  Kinds = [ new KindRule { Kind = ItemKind.Correspondence, RetainFor = TimeSpan.FromDays(365) } ],
+};

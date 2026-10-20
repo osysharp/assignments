@@ -1,0 +1,273 @@
+// An agent's work for an assignment: attached before it starts, settled when it ends, and never run twice once it
+// has finished.
+namespace Osysharp.Assignments.Agents;
+
+using Osysharp.Identity;
+using Osysharp.Agents;
+using Osysharp.Llm;
+using Osysharp.Assignments;
+
+/// ⭐ AGENT WORK DONE FOR AN ASSIGNMENT.
+///
+///     var outcome = await AssignedWork.Do(a, Agents.Of<Tracer>(), new TraceParcel(), order, key: "trace");
+///     if (outcome.Done && outcome.Result.Delivered) { MeetCriterion(…); }
+public class AssignedWork {
+  /// ⭐ GIVE AN AGENT A PIECE OF WORK FOR AN ASSIGNMENT. The same call as `agent.Do(skill, input)`, with three things
+  /// added:
+  ///
+  /// - the work is ATTACHED to the assignment under `key` before the agent starts — the assignment waits on it, and
+  ///   says so, whatever becomes of the run;
+  /// - asked for again under the same key — a process step that is run again after a crash — work that had FINISHED
+  ///   is answered from its receipt, with no model called; work that never reported back is run again; work that
+  ///   failed or was stopped is a new attempt, attached beside the old one;
+  /// - what it SPENDS is charged to the assignment as each model call returns, and the work is held to what the
+  ///   assignment may still spend WHILE it runs — a call that does not fit is never sent, and the work is stopped
+  ///   with what it did; an assignment whose budget is already spent starts none (`AssignmentBudgetSpent`);
+  /// - its receipt is on the assignment before the work runs, so calling the assignment off calls the work off;
+  /// - work that stops on a person (`outcome.Waiting`: a proposal to decide, a question to answer) stays attached
+  ///   and open, and is settled on the assignment when it ends;
+  /// - work the agent HANDS ON to other agents is attached to the same assignment, a piece each, under its own key —
+  ///   for every specialist that is on the assignment — so the assignment shows who is doing what, and what each
+  ///   piece hands back is found from it. The whole tree is charged to the assignment and held to what it has left.
+  ///
+  /// The agent's account must be on the assignment — `Assignees = [Agents.Of<Tracer>().Actor]` — and the assignment
+  /// must be stored: open it in an earlier step, or `UnitOfWork.Commit()` first.
+  public static async Task<AgentOutcome<TOut>> Do<TIn, TOut>(Assignment a, AgentRef agent, Skill<TIn, TOut> skill, TIn input, string key, string about = "") {
+    if (key.Trim() == "") { throw new ValidationException("Agent work for an assignment is attached under a key — what it is found by when the step is run again."); }
+    var title = about != "" ? about : (skill.Description != "" ? skill.Description : AgentName(agent.Name));
+    var start = BeginAgentWork(a.Id, key, title, agent.Actor.Id, agent.Name);
+    if (start.AlreadyDone && start.Task != null) {
+      var receipt = AgentTask.FirstOrDefault(t => t.Id == start.Task);
+      if (receipt != null && receipt!.Status == AgentTaskStatus.Done && receipt!.Result != null) {
+        return new AgentOutcome<TOut> { Status = AgentTaskStatus.Done, Task = receipt!.Id, CostMicros = receipt!.SpentMicros, Result = skill.Read(receipt!.Result!) };
+      }
+    }
+    // Charged to the assignment's own scope, with what it has left as the limit — and the receipt noted on the
+    // assignment before anything is asked of a model.
+    var work = agent.On(new LlmLimit { Scope = start.Scope, LimitMicros = start.RoomMicros }).Open(skill, input, title);
+    NoteAgentWorkOpened(start.Work, work.Task);
+    var outcome = await work.Run();
+    if (outcome.Waiting) {
+      // It stopped on a person — a proposal to decide, a question to answer. The work stays attached and open; it is
+      // settled when it ends (the handlers below), however long the person takes.
+      NoteAgentWorkOpened(start.Work, outcome.Task);
+      return outcome;
+    }
+    EndAgentWork(start.Work, outcome.Task, outcome.Status, outcome.Problem, outcome.CostMicros, AgentName(agent.Name));
+    return outcome;
+  }
+
+  /// Attach a piece of agent work that was run elsewhere — its receipt in hand — to an assignment, with what it
+  /// spent. Attached again under the same key, it is the same piece of work, brought up to date.
+  public static AssignmentWork Attach(Assignment a, AgentTask task, string key = "") {
+    var work = AttachWork(a, new WorkAttachment {
+      Kind = WorkKind.AgentTask, Key = key != "" ? key : "agent-task:" + task.Id.ToString(), Title = task.About != "" ? task.About : AgentName(task.Agent),
+      Subject = task.Id, SubjectType = "AgentTask", WaitingOn = StillGoing(task) ? task.Actor : null, WaitingFor = "its result",
+    });
+    Settle(work, task);
+    return work;
+  }
+
+  /// The agent work attached to an assignment: each piece of work with its receipt, when the reader may read it.
+  public static List<AssignmentWork> Of(Assignment a) {
+    return AssignmentWork.Where(w => w.Assignment == a && w.Kind == WorkKind.AgentTask).OrderBy(w => w.Number).ToList();
+  }
+
+  /// The receipt of a piece of attached agent work, or null — it has not reported back, or it is not the reader's
+  /// to read.
+  public static AgentTask? ReceiptOf(AssignmentWork work) {
+    return work.Subject == null ? null : AgentTask.FirstOrDefault(t => t.Id == work.Subject);
+  }
+}
+
+/// What starting a piece of agent work for an assignment found.
+public class AgentWorkStart {
+  /// The piece of attached work.
+  public Guid Work;
+  /// It had already finished: `Task` is its receipt.
+  public bool AlreadyDone = false;
+  public Guid? Task;
+  /// The assignment's own scope, and what it may still spend — what the work is charged to and held to.
+  public string Scope = "";
+  public long RoomMicros = 0;
+}
+
+/// Attach the work before the agent starts — in a unit of work of its own, so it is there whatever becomes of the run.
+[Server, Authorize(UsesAgents), OwnUnitOfWork]
+internal AgentWorkStart BeginAgentWork(Guid assignment, string key, string title, Guid actor, string agent) {
+  var a = Assignment.FirstOrDefault(x => x.Id == assignment);
+  if (a == null) {
+    throw new AssignmentRefused("Agent work is attached to an assignment that is stored and that whoever asks may read. "
+      + "Open the assignment in an earlier step, or `UnitOfWork.Commit()` before giving the agent work for it.");
+  }
+  // The newest attempt under this key: the key itself, then key#2, key#3 …
+  var attempt = 1;
+  var useKey = key;
+  var latest = WorkOf(a!, useKey);
+  while (latest != null && (latest!.State == WorkState.Failed || latest!.State == WorkState.Cancelled)) {
+    attempt = attempt + 1;
+    useKey = key + "#" + attempt;
+    latest = WorkOf(a!, useKey);
+  }
+  if (latest != null && latest!.State == WorkState.Done) {
+    return new AgentWorkStart { Work = latest!.Id, AlreadyDone = true, Task = latest!.Subject };
+  }
+  if (latest != null) {
+    // Attached and never settled: the run that was to do it did not report back. Its receipt still says the work is
+    // under way; it is called off, so that it is closed as abandoned work is (`CloseAbandonedAgentWork`) and never
+    // read as work somebody is doing. Work that waits for a person is not touched: somebody may still answer it.
+    var earlier = latest!.Subject == null ? null : AgentTask.FirstOrDefault(t => t.Id == latest!.Subject);
+    if (earlier != null && earlier!.Status == AgentTaskStatus.Working) {
+      StopAgentTask(earlier!, "It was started again: the earlier run did not report back.");
+    }
+    NoteWorkActivity(latest!, ActivityKind.Retry, "Started again; the earlier run did not report back.");
+    return Charged(new AgentWorkStart { Work = latest!.Id }, a!);
+  }
+  RequireRoomIn(a!);
+  var who = Principal.Single(p => p.Id == actor);
+  if (!AssignmentParticipant.Any(p => p.Assignment == a && p.Person == who && p.Acts)) {
+    var name = AgentName(agent);
+    throw new AssignmentRefused($"{name} is not on “{a!.Title}”, so it cannot work on it. Put its account on the assignment: "
+      + $"`Assignees = [Agents.Of<{name}>().Actor]` when it is opened, or `AddParticipant(a, Agents.Of<{name}>().Actor, ParticipantRole.Assignee)`.");
+  }
+  var work = AttachWork(a!, new WorkAttachment {
+    Kind = WorkKind.AgentTask, Key = useKey, Title = attempt == 1 ? title : $"{title} (attempt {attempt})", SubjectType = "AgentTask",
+    WaitingOn = who, WaitingFor = "its result",
+  });
+  return Charged(new AgentWorkStart { Work = work.Id }, a!);
+}
+
+/// What the work is charged to: the assignment's own scope, with what the assignment has left as the limit.
+AgentWorkStart Charged(AgentWorkStart start, Assignment a) {
+  var charge = ChargedTo(a).Limits[0];
+  start.Scope = charge.Scope;
+  start.RoomMicros = charge.LimitMicros;
+  return start;
+}
+
+/// Settle the work when the agent has ended — in a unit of work of its own, so the assignment knows how it went
+/// whatever its caller does next.
+[Server, Authorize(UsesAgents), OwnUnitOfWork]
+internal void EndAgentWork(Guid work, Guid task, AgentTaskStatus status, string problem, long costMicros, string agent) {
+  var w = AssignmentWork.Single(x => x.Id == work);
+  if (w.State != WorkState.Open) { return; }
+  UpdateWork(w, new WorkUpdate { Subject = task, SubjectType = "AgentTask", NobodyWaitedOn = true });
+  // What the whole piece of work spent: its own receipt, and the work it handed on.
+  var spent = AgentTask.Where(t => t.Id == task || t.Root.Id == task).Sum(t => t.SpentMicros);
+  var receipt = AgentTask.FirstOrDefault(t => t.Id == task);
+  CountWorkCost(w, spent > costMicros ? spent : costMicros, receipt != null && WasChargedTo(receipt!, w.Assignment));
+  CloseWork(w, StateOf(status), ResultWords(status, problem, agent));
+}
+
+/// Note the receipt of a piece of work on the assignment before the work runs — in a unit of work of its own, so
+/// whoever calls the assignment off while the agent is working finds it.
+[Server, Authorize(UsesAgents), OwnUnitOfWork]
+internal void NoteAgentWorkOpened(Guid work, Guid task) {
+  var w = AssignmentWork.Single(x => x.Id == work);
+  if (w.State != WorkState.Open) { return; }
+  UpdateWork(w, new WorkUpdate { Subject = task, SubjectType = "AgentTask" });
+}
+
+/// Whether a piece of agent work named the assignment's own scope on every model call it made — so the assignment
+/// was charged as the work spent.
+bool WasChargedTo(AgentTask task, Assignment a) {
+  return task.ChargedTo.Split("\n").Contains(AssignmentScope(a));
+}
+
+/// Bring a piece of attached work up to date with its receipt.
+void Settle(AssignmentWork work, AgentTask task) {
+  if (work.State != WorkState.Open) { return; }
+  CountWorkCost(work, CostToCount(task), WasChargedTo(task, work.Assignment));
+  if (StillGoing(task)) { return; }
+  CloseWork(work, StateOf(task.Status), ResultWords(task.Status, OutcomeInWords(task), AgentName(task.Agent)));
+}
+
+/// What a piece of attached agent work counts on its assignment. The work at the top counts the whole tree — its
+/// own calls and those of every piece it handed on — so a piece that was handed on counts nothing itself: what it
+/// spent is read from its receipt.
+long CostToCount(AgentTask task) {
+  if (task.Parent != null) { return 0; }
+  return AgentTask.Where(t => t.Id == task.Id || t.Root == task).Sum(t => t.SpentMicros);
+}
+
+/// Under way, or stopped on a person: it has not ended.
+bool StillGoing(AgentTask task) { return task.Status == AgentTaskStatus.Working || task.Status == AgentTaskStatus.Waiting; }
+
+WorkState StateOf(AgentTaskStatus status) {
+  return status == AgentTaskStatus.Done ? WorkState.Done : status == AgentTaskStatus.Cancelled ? WorkState.Cancelled : WorkState.Failed;
+}
+
+string ResultWords(AgentTaskStatus status, string problem, string agent) {
+  if (status == AgentTaskStatus.Done) { return $"{agent} finished it."; }
+  var how = status == AgentTaskStatus.Stopped ? "was stopped" : status == AgentTaskStatus.Cancelled ? "was called off" : "could not finish";
+  return problem == "" ? $"{agent} {how}." : $"{agent} {how}: {problem}";
+}
+
+// ── kept in step ────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Agent work that was attached while it was still running is settled when it ends, whoever is looking.
+[On]
+internal void AttachedWorkIsSettledWhenItFinishes(AgentTaskFinished e) { SettleAttached(e.Task); }
+[On]
+internal void AttachedWorkIsSettledWhenItFails(AgentTaskFailed e) { SettleAttached(e.Task); }
+[On]
+internal void AttachedWorkIsSettledWhenItIsStopped(AgentTaskStopped e) { SettleAttached(e.Task); }
+
+void SettleAttached(AgentTask task) {
+  foreach (var work in AssignmentWork.Where(w => w.Kind == WorkKind.AgentTask && w.Subject == task.Id && w.State == WorkState.Open).ToList()) {
+    Settle(work, task);
+  }
+}
+
+/// ⭐ WORK AN AGENT HANDS ON while it works for an assignment is the assignment's too: each piece is attached beside
+/// the piece that handed it on — who is doing it, for which skill, and through whom it came — and settled when it
+/// ends like any other. A specialist that is not on the assignment is not attached: the piece above it says so.
+[On]
+internal void HandedOnWorkIsAttachedToo(AgentTaskStarted e) {
+  var task = e.Task;
+  if (task.Parent == null || task.Root == null) { return; }
+  var top = task.Root!.Id;
+  foreach (var above in AssignmentWork.Where(w => w.Kind == WorkKind.AgentTask && w.Subject == top).OrderByDescending(w => w.Number).Take(1).ToList()) {
+    var a = above.Assignment;
+    var doer = task.Actor;
+    var name = AgentName(task.Agent);
+    var through = AgentName(task.Parent!.Agent);
+    if (!AssignmentParticipant.Any(p => p.Assignment == a && p.Person == doer && p.Acts)) {
+      NoteWorkActivity(above, ActivityKind.Note, $"{through} handed part of this to {name}, which is not on the assignment.");
+      continue;
+    }
+    var what = task.Skill == "" ? "work" : SkillWords(task.Skill);
+    AttachWork(a, new WorkAttachment {
+      Kind = WorkKind.AgentTask, Key = "agent-task:" + task.Id.ToString(), Title = Clip($"{name}: {what} — handed on by {through}", 200),
+      Subject = task.Id, SubjectType = "AgentTask", Branch = above.Branch, WaitingOn = doer, WaitingFor = "its result",
+    });
+  }
+}
+
+/// "CheckPapers" → "check papers".
+string SkillWords(string skill) {
+  var words = "";
+  foreach (var c in BareName(skill)) {
+    if (char.IsUpper(c) && words != "") { words = words + " " + char.ToLower(c); }
+    else { words = words + char.ToLower(c); }
+  }
+  return words;
+}
+
+string Clip(string text, int max) { return text.Length <= max ? text : text.Substring(0, max); }
+
+/// An assignment that is called off calls off the agent work attached to it that is still running.
+[On]
+internal void ACalledOffAssignmentCallsOffItsAgents(AssignmentCancelled e) {
+  foreach (var work in AssignmentWork.Where(w => w.Assignment == e.Assignment && w.Kind == WorkKind.AgentTask && w.Subject != null).ToList()) {
+    var task = AgentTask.FirstOrDefault(t => t.Id == work.Subject);
+    if (task == null || !StillGoing(task!)) { continue; }
+    try {
+      StopAgentTask(task!, "The assignment was called off.");
+    } catch (Exception refused) {
+      // Whoever called the assignment off may not stop this agent's work (they neither asked for it nor supervise
+      // the agents). The assignment is still called off; the work is named so somebody who may can stop it.
+      NoteWorkActivity(work, ActivityKind.Note, "Still running — whoever supervises the agents can stop it.");
+    }
+  }
+}
