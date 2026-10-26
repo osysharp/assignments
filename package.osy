@@ -27,7 +27,7 @@
 //     policy OverseesAssignments         => IsLead;      // reads and acts on every assignment
 //     policy AcceptsAssignmentExceptions => IsManager;   // closes one with a criterion unmet, in writing
 package Osysharp.Assignments {
-  version     "2.0.0";
+  version     "2.1.0";
   minPlatform "0.17.0";
   summary     "durable assignments: a piece of work somebody asked for, owned until its outcome is reached — completion by declared criteria (or a written exception), re-openable with its record; agent runs, processes, requests and handoffs attached to it; progress told apart from activity; waiting, blocked, overdue and stalled worked out with their reasons; linked and nested assignments; and what it has cost.";
 
