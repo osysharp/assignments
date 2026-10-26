@@ -8,7 +8,7 @@ or take a month. The assignment is what stays. It completes when its criteria ar
 attached to it happens to have finished.
 
 ```osy
-use Osysharp.Assignments@1;
+use Osysharp.Assignments@2;
 
 var a = OpenAssignment(new NewAssignment {
   Title = "Press P-200 faults intermittently",
@@ -133,7 +133,7 @@ osy test kits/assignments/tests
 
 ## Source and package
 
-- Package: `Osysharp.Assignments` — `use Osysharp.Assignments@1;`
+- Package: `Osysharp.Assignments` — `use Osysharp.Assignments@2;`
 - Source: [`kits/assignments`](.) — `model/Setup.osy` (policies, the app's setting), `Assignment.osy` (the assignment,
   who is on it), `Criteria.osy` (criteria, closing, reopening), `Work.osy` (attached work, done once), `Activity.osy`
   (progress and activity), `Conditions.osy` (waiting, blocked, overdue, stalled), `Links.osy`, `Cost.osy`,
@@ -141,3 +141,8 @@ osy test kits/assignments/tests
 - Uses `Osysharp.Identity` (who asked and who is on it), [`Osysharp.Llm`](../llm) (what it cost) and `Osysharp.Ui`.
 - With it: [`Osysharp.WorkRepositories`](../work-repositories) keeps what an assignment knows as items;
   [`Osysharp.Assignments.Agents`](../assignments-agents) attaches an agent's work to it.
+
+## Changes
+
+- 2.0.0: `WorkRow` is internal to the kit. It was never meant as part of its surface, and `Osysharp.Agents.Management`
+  has a control of the same name. Pin `@2`.

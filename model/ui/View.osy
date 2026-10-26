@@ -338,7 +338,7 @@ public component ReasonRow(string what, string why, Tone tone) {
 
 /// One piece of attached work.
 [Composable]
-public component WorkRow(WorkLine w) {
+internal component WorkRow(WorkLine w) {
   render {
     Stack(gap: "2px", py: 2, borderBW: 1, border: Colors.Border, role: UiRole.ListItem, label: w.Title) {
       Row(gap: 2, align: Align.Center) {
