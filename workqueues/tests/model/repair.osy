@@ -416,7 +416,7 @@ public class MachineRepair : Process<Repair> {
 // ── what the process asks, and keeps ────────────────────────────────────────────────────────────────────────────────
 
 /// Whether the part is on order for the machine, as it is stored now — after whatever a person decided meanwhile.
-[Server, Authorize(IsAuthenticated), OwnUnitOfWork]
+[Server, Authorize(IsAuthenticated), CommitsAlone]
 internal bool PartOrderedNow(Guid machine, string part) { return Machine.Single(m => m.Id == machine).PartOnOrder == part; }
 
 /// Ask the customer's operator for readings: a form made from `PressureReadings`.

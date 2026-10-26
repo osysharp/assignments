@@ -16,14 +16,14 @@
 // ⚑ AN ANSWER CLOSES THE WORK AND COMPLETES NOTHING. The assignment is done when its criteria are met; a request that
 //   ran out of time, or was called off, closes its piece of work as failed or cancelled and waives nothing.
 package Osysharp.Assignments.WorkQueues {
-  version     "1.1.0";
-  minPlatform "0.14.0";
+  version     "1.2.0";
+  minPlatform "0.17.0";
   summary     "what an assignment asks of people: a request put for an assignment is a piece of its work and an item in the inbox of whoever it waits on; what an agent proposes or asks while working for the assignment is attached by itself; the answer closes the work, a reminder and a missed date are on the assignment's trail; the assignment's page lists who it is waiting on, and the inbox item says which assignment it is part of.";
-  completes   Osysharp.Assignments@1, Osysharp.HumanRequests@1;
+  completes   Osysharp.Assignments@2, Osysharp.HumanRequests@1;
 
   model "model/**/*.osy";
   tests "tests";
-  use Osysharp.Assignments@1;
+  use Osysharp.Assignments@2;
   use Osysharp.HumanRequests@1;
   use Osysharp.WorkQueues@1;
   use Osysharp.Llm@2;

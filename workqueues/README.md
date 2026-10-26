@@ -7,7 +7,7 @@ work queue until it is answered. With both in an app, a request put for an assig
 work, and stays in step with it.
 
 ```osy
-use Osysharp.Assignments@1;
+use Osysharp.Assignments@2;
 use Osysharp.HumanRequests@1;
 use Osysharp.Assignments.WorkQueues@1;
 

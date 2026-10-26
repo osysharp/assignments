@@ -9,13 +9,13 @@
 app Pressworks {
   model "model/**/*.osy";
   tests "**/*.test.osy";
-  use Osysharp.Assignments@1;
+  use Osysharp.Assignments@2;
   use Osysharp.Assignments.WorkQueues@1;
   use Osysharp.Assignments.Agents@1;
   use Osysharp.Agents@1;
   use Osysharp.Agents.Testing@1;
   use Osysharp.Agents.HumanRequests@1;
-  use Osysharp.Agents.Inspector@1;
+  use Osysharp.Agents.Inspector@2;
   use Osysharp.Agents.Processes@1;
   use Osysharp.Processes@1;
   use Osysharp.WorkRepositories@1;
