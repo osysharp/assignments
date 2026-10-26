@@ -289,13 +289,13 @@ public void CloseCase(DeliveryCase c) {
 }
 
 /// Call a case off — in a unit of work of its own, as somebody else's request would be.
-[Server, OwnUnitOfWork]
+[Server, CommitsAlone]
 public void CallCaseOff(Guid id, string why) {
   CancelAssignment(DeliveryCase.Single(c => c.Id == id).Assignment, why);
 }
 
 /// What a case has been charged so far, in millionths of a dollar — read where it is stored.
-[Server, OwnUnitOfWork]
+[Server, CommitsAlone]
 public long CaseCost(Guid id) { return CostOf(DeliveryCase.Single(c => c.Id == id).Assignment).TotalMicros; }
 
 // ── what the shop hears ─────────────────────────────────────────────────────────────────────────────────────────────

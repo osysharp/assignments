@@ -13,8 +13,8 @@
 // ⚑ A BRIDGE, SO NEITHER KIT DEPENDS ON THE OTHER. An app that uses Osysharp.Assignments and Osysharp.Agents writes
 //   nothing to get it: `osy lock` includes it and says so.
 package Osysharp.Assignments.Agents {
-  version     "1.3.0";
-  minPlatform "0.14.0";
+  version     "1.4.0";
+  minPlatform "0.17.0";
   summary     "an agent's work attached to the assignment it is for: attached under a key before the run starts, answered from its receipt when it had already finished, run again when it never reported back; its cost counted on the assignment, refused once the assignment's budget is spent; called off when the assignment is; work the agent hands on to other agents is attached to the same assignment, a piece each, and the whole is counted once.";
   completes   Osysharp.Assignments@1, Osysharp.Agents@1;
   model "model/*.osy";

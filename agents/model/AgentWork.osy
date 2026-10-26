@@ -93,7 +93,7 @@ public class AgentWorkStart {
 }
 
 /// Attach the work before the agent starts — in a unit of work of its own, so it is there whatever becomes of the run.
-[Server, Authorize(UsesAgents), OwnUnitOfWork]
+[Server, Authorize(UsesAgents), CommitsAlone]
 internal AgentWorkStart BeginAgentWork(Guid assignment, string key, string title, Guid actor, string agent) {
   var a = Assignment.FirstOrDefault(x => x.Id == assignment);
   if (a == null) {
@@ -147,7 +147,7 @@ AgentWorkStart Charged(AgentWorkStart start, Assignment a) {
 
 /// Settle the work when the agent has ended — in a unit of work of its own, so the assignment knows how it went
 /// whatever its caller does next.
-[Server, Authorize(UsesAgents), OwnUnitOfWork]
+[Server, Authorize(UsesAgents), CommitsAlone]
 internal void EndAgentWork(Guid work, Guid task, AgentTaskStatus status, string problem, long costMicros, string agent) {
   var w = AssignmentWork.Single(x => x.Id == work);
   if (w.State != WorkState.Open) { return; }
@@ -161,7 +161,7 @@ internal void EndAgentWork(Guid work, Guid task, AgentTaskStatus status, string 
 
 /// Note the receipt of a piece of work on the assignment before the work runs — in a unit of work of its own, so
 /// whoever calls the assignment off while the agent is working finds it.
-[Server, Authorize(UsesAgents), OwnUnitOfWork]
+[Server, Authorize(UsesAgents), CommitsAlone]
 internal void NoteAgentWorkOpened(Guid work, Guid task) {
   var w = AssignmentWork.Single(x => x.Id == work);
   if (w.State != WorkState.Open) { return; }
