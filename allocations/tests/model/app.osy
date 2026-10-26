@@ -408,13 +408,13 @@ public class DisruptionResponseProcess : Process<Disruption> {
 
 // ── what the process does between its steps ─────────────────────────────────────────────────────────────────────────
 
-[Server, Authorize(IsAuthenticated), OwnUnitOfWork]
+[Server, Authorize(IsAuthenticated), CommitsAlone]
 internal List<Guid> RegionsOf(Guid disruption) { return SalesRegion.Where(r => r.Disruption.Id == disruption).OrderBy(r => r.Rank).ToList().Select(r => r.Id).ToList(); }
-[Server, Authorize(IsAuthenticated), OwnUnitOfWork]
+[Server, Authorize(IsAuthenticated), CommitsAlone]
 internal List<Guid> RegionsToReplan(Guid disruption) { return SalesRegion.Where(r => r.Disruption.Id == disruption && r.NeedsReplan && !r.Settled).OrderBy(r => r.Rank).ToList().Select(r => r.Id).ToList(); }
-[Server, Authorize(IsAuthenticated), OwnUnitOfWork]
+[Server, Authorize(IsAuthenticated), CommitsAlone]
 internal int ReplanOf(Guid disruption) { return Disruption.Single(d => d.Id == disruption).Replans; }
-[Server, Authorize(IsAuthenticated), OwnUnitOfWork]
+[Server, Authorize(IsAuthenticated), CommitsAlone]
 internal bool EveryRegionIsSettled(Guid disruption) { return !SalesRegion.Any(r => r.Disruption.Id == disruption && !r.Settled); }
 public SalesRegion RegionBy(Guid id) { return SalesRegion.Single(r => r.Id == id); }
 

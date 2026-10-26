@@ -3,7 +3,7 @@
 What several assignments compete for — and who holds how much of it.
 
 ```osy
-use Osysharp.Assignments@1;
+use Osysharp.Assignments@2;
 use Osysharp.Assignments.Allocations@1;
 
 policy KeepsSharedPools      => IsOperations;                  // says what there is; decides who gives way

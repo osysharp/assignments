@@ -25,13 +25,13 @@
 // ⚑ AN ASSIGNMENT THAT IS CLOSED HOLDS NOTHING. Completed, called off or failed, what it held goes back, and whoever
 //   was waiting is given it in the order they asked.
 package Osysharp.Assignments.Allocations {
-  version     "1.1.0";
-  minPlatform "0.14.0";
+  version     "1.2.0";
+  minPlatform "0.17.0";
   summary     "shared resources between assignments: a pool with a counted amount (stock, hours, money), claims that are held or refused so two assignments never hold the same unit, claims that wait their turn, what happens when there is less than was thought (the pool is overdrawn, each holder is told, the pool's keeper decides who gives way), and release when an assignment closes; with the pool's page and a panel on every assignment";
 
   model "model/**/*.osy";
   tests "tests";
-  use Osysharp.Assignments@1;
+  use Osysharp.Assignments@2;
   use Osysharp.Identity@0;
   use Osysharp.Llm@2;
   use Osysharp.Workflow;
