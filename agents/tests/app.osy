@@ -6,7 +6,7 @@
 app Teashop {
   model "model/**/*.osy";
   tests "**/*.test.osy";
-  use Osysharp.Assignments@1;
+  use Osysharp.Assignments@2;
   use Osysharp.Assignments.Agents@1;
   use Osysharp.WorkRepositories@1;
   use Osysharp.Agents@1;
