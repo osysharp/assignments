@@ -62,3 +62,104 @@ of time, asking twice under one key, an agent's proposal attached by itself — 
 - Package: `Osysharp.Assignments.WorkQueues` · completes `Osysharp.Assignments` and `Osysharp.HumanRequests` (whose
   requests are items of `Osysharp.WorkQueues`).
 - Reference: `osy docs agent-assignment-requests`.
+
+## Examples
+
+Taken from this package's own tests, which compile and run on every release.
+
+```osy
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Assignments;
+using Osysharp.Assignments.WorkQueues;
+using Osysharp.Assignments.Agents;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Workflow;
+using Pressworks;
+
+[Test(Floor)]
+void an_answer_closes_the_work_and_completes_nothing() {
+  var job = OpenPressJob();
+  runas (Dana) { AskCustomerToApprove(JobBy(job), Carl, 480m); AskForAVisit(JobBy(job), Tariq); }
+  Background.Settle();
+  runas (Carl) { AnswerRequest(Requests.Mine().Single(), RequestAnswer.Approve()); }
+  runas (Tariq) { AnswerRequest(Requests.Mine().Single(), RequestAnswer.Choose("next-week")); }
+  Background.Settle();
+  runas (Mona) {
+    var a = JobBy(job);
+    var work = AssignmentWork.Where(w => w.Assignment == a).OrderBy(w => w.Number).ToList();
+    Assert.Equal([WorkState.Done, WorkState.Done], work.Select(w => w.State).ToList());
+    Assert.Equal("Approved by Carl Lind.", work[0].Result);
+    Assert.Equal("Answered by Tariq Aziz.", work[1].Result);
+    Assert.Equal(0, AssignmentRequests.Open(a).Count);
+    // No request is open now — and nothing is done either: what done means is the criteria, and none is met.
+    Assert.Equal(AssignmentState.Open, a.State);
+    Assert.Equal(3, a.Criteria.Count(c => c.State == CriterionState.Unmet));
+    Assert.Throws<CriteriaUnmet>(() => CompleteAssignment(a, "The customer approved."));
+  }
+}
+```
+
+From [`tests/requests.test.osy`](tests/requests.test.osy).
+
+```osy
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Assignments;
+using Osysharp.Assignments.WorkQueues;
+using Osysharp.Workflow;
+using Pressworks;
+
+[Test(Floor)]
+void signing_in_takes_the_right_code_and_nothing_else() {
+  Assert.NotEqual("", SignInWithCode("dana@pressworks.example", "1111"));
+  Assert.Equal("", SignInWithCode("dana@pressworks.example", "9999"));
+  Assert.Equal("", SignInWithCode("nobody@pressworks.example", "1111"));
+}
+```
+
+From [`tests/ui.test.osy`](tests/ui.test.osy).
+
+```osy
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Assignments;
+using Osysharp.Assignments.WorkQueues;
+using Osysharp.Assignments.Agents;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Workflow;
+using Pressworks;
+
+[Test(Floor)]
+void asking_again_under_the_same_key_puts_nothing_twice() {
+  var job = OpenPressJob();
+  runas (Dana) {
+    var first = AskForAVisit(JobBy(job), Tariq);
+    UnitOfWork.Commit();
+    var again = AskForAVisit(JobBy(job), Tariq);
+    Assert.Equal(first.Id, again.Id);
+    Assert.Equal(1, HumanRequest.Count());
+  }
+  runas (Mona) { Assert.Equal(1, AssignmentWork.Count(w => w.Kind == WorkKind.Request)); }
+}
+```
+
+From [`tests/requests.test.osy`](tests/requests.test.osy).
+
+## Learn more
+
+- [The Osysharp.Assignments.WorkQueues reference](https://osysharp.com/reference/agent/kit-assignments-work-queues/)
+- [Osysharp.Assignments.WorkQueues in the package catalogue](https://osysharp.com/packages/#osysharp-assignments-workqueues)
+- [The Osy# reference](https://osysharp.com/reference/) — the language, the runtime and every kit
+- [`llms-full.txt`](https://osysharp.com/llms-full.txt) — the whole reference and specification as one Markdown file, for a coding agent
+
+## Licence
+
+MIT — see [`LICENSE`](LICENSE).
