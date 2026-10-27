@@ -85,3 +85,139 @@ osy test kits/assignments-agents/tests
 - Package: `Osysharp.Assignments.Agents` — it arrives by itself in an app that uses
   [`Osysharp.Assignments`](../assignments) and [`Osysharp.Agents`](../agents); or `use Osysharp.Assignments.Agents@1;`
 - Source: [`kits/assignments-agents`](.) — `model/AgentWork.osy`
+
+## Examples
+
+Taken from this package's own tests, which compile and run on every release.
+
+```osy
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Assignments;
+using Osysharp.Assignments.Agents;
+using Osysharp.WorkRepositories;
+using Teashop;
+
+[Test(Shop)]
+void agent_work_that_had_finished_is_answered_from_its_receipt_with_no_model_called() {
+  var id = NoraReports();
+  Guid first = Guid.Empty;
+  runas (Sana) {
+    var script = InvestigationScript(Case(id));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    first = Investigate(Case(id)).Task;
+  }
+  Background.Settle();
+  runas (Sana) {
+    // The step is run again — a process that was restarted after the work had finished. No model answers this time.
+    ScriptedAnswer.Stub((model, request) => { throw new InvalidOperationException("No model should be asked."); });
+    var again = Investigate(Case(id));
+    Assert.True(again.Done);
+    Assert.Equal(first, again.Task);
+    Assert.True(again.Result.Lost);
+    Assert.Equal("Held as damaged at the Malmö depot since 6 March.", again.Result.What);
+    var again1 = Case(id).Assignment;
+    Assert.Equal(1, again1.Work.Count());
+    Assert.Equal(800, CostOf(Case(id).Assignment).WorkMicros);
+  }
+  runas (Lars) { Assert.Equal(1, AgentTask.Count()); }
+}
+```
+
+From [`tests/delivery.test.osy`](tests/delivery.test.osy).
+
+```osy
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Assignments;
+using Osysharp.Assignments.Agents;
+using Osysharp.WorkRepositories;
+using Teashop;
+
+[Test(Shop)]
+void a_specialist_that_is_not_on_the_assignment_is_not_attached_and_the_case_says_so() {
+  TestClock.Set(Tuesday());
+  var id = NoraReports();
+  Guid leading = Guid.Empty;
+  runas (Sana) {
+    var c = Case(id);
+    // Only what the lead hands on, with nothing written to the case by the resolver: it is not on it.
+    var cast = AgentCast.Of()
+      .Plays<CaseLead>(AgentScript.Of(
+        Says.HandTo<Resolver>(new InvestigateDelivery(), Says.Row(c.Order.Id)),
+        Says.HandBack(new DeliveryFinding { Lost = true, What = "Held at the depot.", Suggests = "refund" })))
+      .Plays<Resolver>(AgentScript.Of(
+        Says.Tool(Actions.Of(TrackParcel), OrderArg(c)),
+        Says.HandBack(new DeliveryFinding { Lost = true, What = "Held at the depot.", Suggests = "refund" })));
+    ScriptedAnswer.Stub((model, request) => cast.Answer(model, request));
+    var outcome = Lead(c, withTheResolver: false);
+    Assert.Equal("", outcome.Problem);
+    leading = outcome.Task;
+  }
+  Background.Settle();
+  runas (Sana) {
+    var a = Case(id).Assignment;
+    // One piece on the case — the lead's — which still counts the whole tree, and a note of what was handed to whom.
+    Assert.Equal(["Lead the case of order T-1042"], AssignedWork.Of(a).Select(w => w.Title).ToList());
+    Assert.Equal(800, AssignedWork.Of(a)[0].CostMicros);
+    Assert.Equal(1, AssignmentActivity.Count(n => n.Assignment == a
+      && n.Said == "Lead the case of order T-1042: Case lead handed part of this to Resolver, which is not on the assignment."));
+  }
+}
+```
+
+From [`tests/handed-on.test.osy`](tests/handed-on.test.osy).
+
+```osy
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Assignments;
+using Osysharp.Assignments.Agents;
+using Osysharp.WorkRepositories;
+using Teashop;
+
+[Test(Shop)]
+void work_that_failed_is_a_new_attempt_beside_the_old_one() {
+  var id = NoraReports();
+  runas (Sana) {
+    // The model never manages a finding that fits: the work fails.
+    var bad = AgentScript.Of(Says.HandBack(new DeliveryFinding { Suggests = "shrug" }), Says.HandBack(new DeliveryFinding { Suggests = "dunno" }));
+    ScriptedAnswer.Stub((model, request) => bad.Answer(model, request));
+    var failed = Investigate(Case(id));
+    Assert.Equal(AgentTaskStatus.Failed, failed.Status);
+    var a = Case(id).Assignment;
+    Assert.Equal(WorkState.Failed, WorkOf(a, "investigate")!.State);
+    Assert.StartsWith("Resolver could not finish:", WorkOf(a, "investigate")!.Result);
+    // What it spent failing is still the case's cost.
+    Assert.Equal(400, CostOf(a).WorkMicros);
+
+    var script = InvestigationScript(Case(id));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    Assert.True(Investigate(Case(id)).Done);
+    a = Case(id).Assignment;
+    Assert.Equal(WorkState.Failed, WorkOf(a, "investigate")!.State);
+    Assert.Equal(WorkState.Done, WorkOf(a, "investigate#2")!.State);
+    Assert.Equal("Find out where order T-1042 is (attempt 2)", WorkOf(a, "investigate#2")!.Title);
+    Assert.Equal(1200, CostOf(a).WorkMicros);
+  }
+}
+```
+
+From [`tests/delivery.test.osy`](tests/delivery.test.osy).
+
+## Learn more
+
+- [The Osysharp.Assignments.Agents reference](https://osysharp.com/reference/agent/kit-assignments-agents/)
+- [Osysharp.Assignments.Agents in the package catalogue](https://osysharp.com/packages/#osysharp-assignments-agents)
+- [The Osy# reference](https://osysharp.com/reference/) — the language, the runtime and every kit
+- [`llms-full.txt`](https://osysharp.com/llms-full.txt) — the whole reference and specification as one Markdown file, for a coding agent
+
+## Licence
+
+MIT — see [`LICENSE`](LICENSE).
