@@ -146,3 +146,104 @@ osy test kits/assignments/tests
 
 - 2.0.0: `WorkRow` is internal to the kit. It was never meant as part of its surface, and `Osysharp.Agents.Management`
   has a control of the same name. Pin `@2`.
+
+## Examples
+
+Taken from this package's own tests, which compile and run on every release.
+
+```osy
+using Osysharp.Identity;
+using Osysharp.Assignments;
+using Workshop;
+
+[Test(Floor)]
+void an_assignment_says_who_asked_the_outcome_wanted_and_what_done_means() {
+  var job = OpenPressJob();
+  runas (Dana) {
+    var a = Job(job);
+    Assert.Equal("Press P-200 faults intermittently", a.Title);
+    Assert.Equal("The press runs a full shift without faulting.", a.Goal);
+    Assert.Equal(Dana.Id, a.Requester.Id);
+    Assert.Equal(AssignmentState.Open, a.State);
+    Assert.Equal(["The cause is found", "The customer approved the cost", "The press ran clean for a shift"],
+                 a.Criteria.OrderBy(c => c.Position).ToList().Select(c => c.Text).ToList());
+    Assert.True(a.Criteria.All(c => c.State == CriterionState.Unmet));
+    // Whoever asked and whoever does the work are on it from the start.
+    Assert.Equal(ParticipantRole.Requester, a.Participants.Single(p => p.Person.Id == Dana.Id).Role);
+    Assert.Equal(ParticipantRole.Assignee, a.Participants.Single(p => p.Person.Id == Tariq.Id).Role);
+    // The workshop's own record points at it.
+    Assert.Equal(a.Id, Machine.Single(m => m.Serial == "P-200").Job!.Id);
+    Assert.Equal("Opened: The press runs a full shift without faulting.", ActivityOf(a)[0].Said);
+  }
+}
+```
+
+From [`tests/criteria.test.osy`](tests/criteria.test.osy).
+
+```osy
+using Osysharp.Identity;
+using Osysharp.Assignments;
+using Workshop;
+
+[Test(Floor)]
+void whoever_asked_can_be_taken_off_and_the_assignment_is_left_to_whoever_oversees() {
+  var job = PressJobWithTariqsWork();
+  runas (Rosa) { TakePersonOffAssignment(Job(job), Dana, "a former colleague", "She left and asked to be erased."); }
+  runas (Mona) {
+    var a = Job(job);
+    Assert.Null(a.Requester);
+    Assert.Equal("Somebody no longer here", SheetOf(a.Id).Requester);
+    // It is still worked on, and still closed by what done means.
+    MeetCriterion(Criterion(a, 2), "The customer approved 4,200");
+    MeetCriterion(Criterion(a, 3), "It ran a shift clean");
+    CompleteAssignment(a, "Repaired.");
+    Assert.Equal(AssignmentState.Completed, Job(job).State);
+  }
+  // Tariq, the assignee, still reads and works on it as before.
+  runas (Tariq) { Assert.Equal(1, Assignment.Count()); }
+  runas (Dana) { Assert.Equal(0, Assignment.Count()); }
+}
+```
+
+From [`tests/erasure.test.osy`](tests/erasure.test.osy).
+
+```osy
+using Osysharp.Identity;
+using Osysharp.Assignments;
+using Workshop;
+
+[Test(Floor)]
+void reopening_the_one_below_puts_the_criterion_above_back_in_question() {
+  var recall = OpenRecall();
+  var first = OpenUnder(recall.Id, "P-200", Tariq.Id);
+  runas (Tariq) {
+    MeetCriterion(Job(first).Criteria.Single(), "Fitted and tested");
+    CompleteAssignment(Job(first), "The new valve is in.");
+  }
+  Background.Settle();
+  runas (Mona) { Assert.Equal(CriterionState.Met, Job(recall).Criteria.Single(c => c.Position == 2).State); }
+
+  runas (Mona) { ReopenAssignment(Job(first), "The new valve leaks."); }
+  Background.Settle();
+  runas (Mona) {
+    var bound = Job(recall).Criteria.Single(c => c.Position == 2);
+    Assert.Equal(CriterionState.Unmet, bound.State);
+    Assert.Equal(1, bound.Reopened);
+    Assert.Contains("Back in question: “P-200 has the new valve” — “New valve on P-200” was opened again. (It was met by: “New valve on P-200” is completed..)",
+                    ActivityOf(Job(recall)).Select(l => l.Said).ToList());
+  }
+}
+```
+
+From [`tests/links.test.osy`](tests/links.test.osy).
+
+## Learn more
+
+- [The Osysharp.Assignments reference](https://osysharp.com/reference/agent/kit-assignments/)
+- [Osysharp.Assignments in the package catalogue](https://osysharp.com/packages/#osysharp-assignments)
+- [The Osy# reference](https://osysharp.com/reference/) — the language, the runtime and every kit
+- [`llms-full.txt`](https://osysharp.com/llms-full.txt) — the whole reference and specification as one Markdown file, for a coding agent
+
+## Licence
+
+MIT — see [`LICENSE`](LICENSE).
