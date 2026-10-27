@@ -94,3 +94,115 @@ Two claims made at the same moment cannot both pass because the pool's held amou
 - Package: `Osysharp.Assignments.Allocations` — add `use Osysharp.Assignments.Allocations@1;`
 - Source: [`kits/assignments-allocations`](.) — `model/Pools.osy`, `model/ui/Pools.osy`
 - Uses [`Osysharp.Assignments`](../assignments) and `Osysharp.Ui`.
+
+## Examples
+
+Taken from this package's own tests, which compile and run on every release.
+
+```osy
+using Osysharp.Identity;
+using Osysharp.Assignments;
+using Osysharp.Assignments.Allocations;
+using Pumpworks;
+
+[Test(Plant)]
+void a_claim_is_held_and_one_that_does_not_fit_is_refused_saying_who_holds_the_rest() {
+  var jobs = ThreeJobsAndAPool();
+  runas (Bram) {
+    var held = Claim(Stock(), JobBy(jobs[0]), 80, "Nordic orders due this month", key: "stock");
+    Assert.Equal(AllocationState.Held, held.State);
+    Assert.Equal(80, Stock().Held);
+    Assert.Equal(40, LeftIn(Stock()));
+    // It is said on the job, where whoever follows the job reads it.
+    Assert.True(ActivityOf(JobBy(jobs[0]), 20).Any(l => l.Said == "Holds 80 housings of Housings in the Malmö warehouse: Nordic orders due this month"));
+  }
+  runas (Clara) {
+    var refused = Assert.Throws<NotEnoughLeft>(() => Claim(Stock(), JobBy(jobs[1]), 60, "DACH orders due this month", key: "stock"));
+    Assert.Equal("40 housings of Housings in the Malmö warehouse are left, and “DACH” asked for 60 housings. Held: 80 housings for Nordic orders due this month.", refused.Message);
+    Assert.Equal(40, refused.Left);
+    // Nothing was taken by the claim that was refused.
+    Assert.Equal(80, Stock().Held);
+    Assert.Equal(0, Allocation.Count(c => c.Assignment.Id == jobs[1]));
+    // She sees the pool, and what each share of it is for — not the other job, which is not hers to read.
+    var view = PoolOf(Stock().Id);
+    Assert.Equal(["Nordic orders due this month"], view.Holding.Select(l => l.Why).ToList());
+    Assert.Equal([""], view.Holding.Select(l => l.AssignmentTitle).ToList());
+    Assert.Equal(0, Assignment.Count(a => a.Id == jobs[0]));
+    // What is left can be had.
+    Claim(Stock(), JobBy(jobs[1]), 40, "DACH orders due this month", key: "stock");
+    Assert.Equal(0, LeftIn(Stock()));
+  }
+}
+```
+
+From [`tests/pools.test.osy`](tests/pools.test.osy).
+
+```osy
+using Osysharp.Identity;
+using Osysharp.Assignments;
+using Osysharp.Assignments.Allocations;
+using Pumpworks;
+
+[Test(Plant)]
+void a_claim_made_again_under_the_same_key_is_the_claim_already_made() {
+  var jobs = ThreeJobsAndAPool();
+  runas (Bram) {
+    var first = Claim(Stock(), JobBy(jobs[0]), 80, "Nordic orders due this month", key: "stock");
+    var again = Claim(Stock(), JobBy(jobs[0]), 80, "Nordic orders due this month", key: "stock");
+    Assert.Equal(first.Id, again.Id);
+    Assert.Equal(80, Stock().Held);
+    Assert.Equal(1, Allocation.Count());
+  }
+}
+```
+
+From [`tests/pools.test.osy`](tests/pools.test.osy).
+
+```osy
+using Osysharp.Identity;
+using Osysharp.Assignments;
+using Osysharp.Assignments.Allocations;
+using Pumpworks;
+
+[Test(Plant)]
+void a_job_that_is_closed_holds_nothing_and_whoever_waited_is_served() {
+  var jobs = ThreeJobsAndAPool();
+  runas (Bram) { Claim(Stock(), JobBy(jobs[0]), 100, "Nordic orders due this month", key: "stock"); }
+  runas (Clara) { AskFor(Stock(), JobBy(jobs[1]), 60, "DACH orders due this month", key: "stock"); }
+  runas (Deniz) { AskFor(Stock(), JobBy(jobs[2]), 30, "UK orders due this month", key: "stock"); }
+
+  // The Nordic job is called off: what it held goes back, and both who waited are served, in turn.
+  runas (Bram) { CancelAssignment(JobBy(jobs[0]), "The Nordic customers took another pump."); }
+  Background.Settle();
+  runas (Astrid) {
+    Assert.Equal(AllocationState.Released, ClaimOf(jobs[0]).State);
+    Assert.Equal("The assignment was called off: The Nordic customers took another pump.", ClaimOf(jobs[0]).Note);
+    Assert.Equal(AllocationState.Held, ClaimOf(jobs[1]).State);
+    Assert.Equal(AllocationState.Held, ClaimOf(jobs[2]).State);
+    Assert.Equal(90, Stock().Held);
+  }
+  // A job that was waiting and is called off waits no more, and a closed job claims nothing.
+  runas (Deniz) {
+    CancelAssignment(JobBy(jobs[2]), "The UK customers agreed to wait.");
+    Assert.Throws<AssignmentClosed>(() => Claim(Stock(), JobBy(jobs[2]), 5, "More", key: "late"));
+  }
+  Background.Settle();
+  runas (Astrid) {
+    Assert.Equal(AllocationState.Released, ClaimOf(jobs[2]).State);
+    Assert.Equal(60, Stock().Held);
+  }
+}
+```
+
+From [`tests/pools.test.osy`](tests/pools.test.osy).
+
+## Learn more
+
+- [The Osysharp.Assignments.Allocations reference](https://osysharp.com/reference/agent/assignment-allocations/)
+- [Osysharp.Assignments.Allocations in the package catalogue](https://osysharp.com/packages/#osysharp-assignments-allocations)
+- [The Osy# reference](https://osysharp.com/reference/) — the language, the runtime and every kit
+- [`llms-full.txt`](https://osysharp.com/llms-full.txt) — the whole reference and specification as one Markdown file, for a coding agent
+
+## Licence
+
+MIT — see [`LICENSE`](LICENSE).
