@@ -209,6 +209,12 @@ string DisruptionNamed(string value) {
   var d = Disruption.FirstOrDefault(x => x.Id == Guid.Parse(value));
   return d == null ? value : d!.Title;
 }
+/// The region a proposed tool names, by its arguments as the model gave them.
+SalesRegion RegionIn(string argumentsJson) {
+  var values = JsonSerializer.Deserialize<Dictionary<string, Json>>(argumentsJson);
+  var id = Guid.Parse(values["region"].ToString().Replace("\"", ""));
+  return SalesRegion.Single(r => r.Id == id);
+}
 string InTheirWords(string argument, string value) {
   return argument == "region" ? RegionNamed(value) : argument == "disruption" ? DisruptionNamed(value) : argument == "housings" ? value + " housings" : value;
 }
@@ -260,6 +266,8 @@ public class PlanARegion : Skill<SalesRegion, RegionPlan> {
   public override List<ActionInfo> Tools => [Actions.Of(ReserveStock), Actions.Of(WaitForStock), Actions.Of(AskTheFoundry)];
   public override string Brief(SalesRegion r) => $"{r.Name} needs {r.Need} housings this month. The region's id is {r.Id}.";
   public override string Names(string action, string argument, string value) => InTheirWords(argument, value);
+  // What it proposes for a region is the region's lead's to decide — the planner works as itself, not for her.
+  public override ProposalRoute? DecidedBy(string action, string argumentsJson) => ProposalRoute.ToPerson(RegionIn(argumentsJson).Lead);
 }
 
 /// Plans again for a region whose share of the stock was cut.
@@ -268,6 +276,8 @@ public class ReviseAPlan : Skill<SalesRegion, RegionPlan> {
   public override List<ActionInfo> Tools => [Actions.Of(ListItems), Actions.Of(DeferOrders), Actions.Of(AskTheFoundry)];
   public override string Brief(SalesRegion r) => $"{r.Name} needs {r.Need} housings and now holds {r.FromStock}. The region's id is {r.Id}; its job's id is {r.Job!.Id}.";
   public override string Names(string action, string argument, string value) => InTheirWords(argument, value);
+  // What it proposes for a region is the region's lead's to decide — the planner works as itself, not for her.
+  public override ProposalRoute? DecidedBy(string action, string argumentsJson) => ProposalRoute.ToPerson(RegionIn(argumentsJson).Lead);
 }
 
 [Actor(Roles = [PlantRole.Analysing])]
@@ -325,7 +335,7 @@ workflow DisruptionResponse {
 
   state Assessing {
     enter {
-      var looked = await AssignedWork.Do(this.Item.Job, Agents.Of<ResponseCoordinator>().For(this.Item.Director), new AssessTheDisruption(), this.Item,
+      var looked = await AssignedWork.Do(this.Item.Job, Agents.Of<ResponseCoordinator>(), new AssessTheDisruption(), this.Item,
                                          key: "assess", about: "What is at risk: " + this.Item.Title);
       if (!looked.Done) { Processes.Problem("The coordinator could not assess the disruption: " + looked.Problem + " Each region's lead is asked instead."); }
       OpenTheRegions(this.Item);
@@ -343,7 +353,7 @@ workflow DisruptionResponse {
     enter {
       // One region at a time, in the order the director ranked them: who plans first is served first.
       foreach (var region in RegionsOf(this.Item.Id)) {
-        var plan = await AssignedWork.Do(RegionBy(region).Job!, Agents.Of<RecoveryPlanner>().For(RegionBy(region).Lead), new PlanARegion(), RegionBy(region),
+        var plan = await AssignedWork.Do(RegionBy(region).Job!, Agents.Of<RecoveryPlanner>(), new PlanARegion(), RegionBy(region),
                                          key: "plan", about: "Recovery plan: " + RegionBy(region).Name);
         KeepPlan(region, plan.Done, plan.Done ? plan.Result.Why : plan.Problem);
       }
@@ -376,7 +386,7 @@ workflow DisruptionResponse {
       var ask = Workflow.Once("who-gives-way", () => AskWhoGivesWay(this.Item));
       var answer = await Requests.Answer(ask);
       foreach (var region in RegionsToReplan(this.Item.Id)) {
-        var plan = await AssignedWork.Do(RegionBy(region).Job!, Agents.Of<RecoveryPlanner>().For(RegionBy(region).Lead), new ReviseAPlan(), RegionBy(region),
+        var plan = await AssignedWork.Do(RegionBy(region).Job!, Agents.Of<RecoveryPlanner>(), new ReviseAPlan(), RegionBy(region),
                                          key: "revise-" + ReplanOf(this.Item.Id).ToString(), about: "Revised plan: " + RegionBy(region).Name);
         KeepRevisedPlan(region, plan.Done, plan.Done ? plan.Result.Why : plan.Problem);
       }
