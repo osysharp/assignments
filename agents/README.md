@@ -83,7 +83,7 @@ osy test kits/assignments-agents/tests
 ## Source and package
 
 - Package: `Osysharp.Assignments.Agents` — it arrives by itself in an app that uses
-  [`Osysharp.Assignments`](../assignments) and [`Osysharp.Agents`](../agents); or `use Osysharp.Assignments.Agents@1;`
+  [`Osysharp.Assignments`](../assignments) and [`Osysharp.Agents`](../agents); or `use Osysharp.Assignments.Agents@2;`
 - Source: [`kits/assignments-agents`](.) — `model/AgentWork.osy`
 
 ## Examples
