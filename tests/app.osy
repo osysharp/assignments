@@ -5,7 +5,7 @@ app Workshop {
   model "model/**/*.osy";
   tests "**/*.test.osy";
   use Osysharp.Assignments@2;
-  use Osysharp.Llm@2;
+  use Osysharp.Llm@3;
   use Osysharp.Identity@0;
   use Osysharp.Observability;
   use Osysharp.Workflow;

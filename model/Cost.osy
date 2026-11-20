@@ -62,9 +62,9 @@ public AssignmentCost CostOf(Assignment a) {
   // Summed from each piece of work's own figure — nothing is kept on the assignment for two pieces of work that
   // report at the same moment to write over.
   cost.WorkMicros = AssignmentWork.Where(w => w.Assignment == a).Sum(w => w.CostMicros);
-  // Summed where it is stored, so a call settled a moment ago in a unit of work of its own is already counted.
-  var scope = AssignmentScope(a);
-  var charged = LlmAllowance.Where(x => x.Scope == scope && x.Window == LlmBudgetWindow.Total).Sum(x => x.SpentMicros);
+  // What the model kit counted against the assignment's limit, asked of the kit (its count is not the caller's to
+  // read) and summed where it is stored, so a call settled a moment ago in a unit of work of its own is counted.
+  var charged = (long)Math.Round(SpentAgainst(AssignmentScope(a)) * 1000000m);
   // Work whose calls named this scope as they were made is in that figure already: its share is the work's, the
   // rest is the assignment's own — which, while such work is still running, includes what it has spent so far.
   cost.OwnMicros = Math.Max(0, charged - ChargedWorkOf(a));
